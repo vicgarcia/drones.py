@@ -1,4 +1,4 @@
-# faa.py
+# drones.py
 
 A Python CLI for drone pilots: FAA airspace and aviation weather for any place in the US, with a single go/no-go preflight.
 
@@ -21,26 +21,26 @@ A Python CLI for drone pilots: FAA airspace and aviation weather for any place i
 
 ```bash
 # Clone and make executable
-git clone https://github.com/vicgarcia/faa.py.git
-cd faa.py
-chmod +x faa.py
+git clone https://github.com/vicgarcia/drones.py.git
+cd drones.py
+chmod +x drones.py
 
 # Run (dependencies install on first run)
-./faa.py --help
+./drones.py --help
 
 # Install
-cp faa.py ~/.local/bin
-chmod +x ~/.local/bin/faa.py
+cp drones.py ~/.local/bin
+chmod +x ~/.local/bin/drones.py
 ```
 
 ## Configuration
 
 ```bash
 # Your aircraft's wind limit in knots (default 20); --max-wind overrides it
-export FAA_MAX_WIND=18
+export DRONES_MAX_WIND=18
 
 # Browser for map --png, when Chrome/Edge/Chromium is not found automatically
-export FAA_BROWSER="/path/to/chrome"
+export DRONES_BROWSER="/path/to/chrome"
 ```
 
 ## Commands
@@ -63,9 +63,9 @@ also take station IDs (`KFLL`, or `KFLL,KMIA`).
 ### Preflight
 
 ```bash
-faa.py preflight "Hollywood, FL"
-faa.py preflight "Hollywood Beach, FL" --at "tomorrow 7am" --max-wind 15
-faa.py preflight 41.79,-87.74 --at 2pm --altitude 200 --json
+drones.py preflight "Hollywood, FL"
+drones.py preflight "Hollywood Beach, FL" --at "tomorrow 7am" --max-wind 15
+drones.py preflight 41.79,-87.74 --at 2pm --altitude 200 --json
 ```
 
 ```
@@ -99,7 +99,7 @@ TEMPO/PROB overlays, whose failures only raise CAUTION. An active TFR, prohibite
 national defense airspace is NO-GO regardless of weather. Exits 3 on NO-GO.
 
 TFRs are judged at the time you ask about. The FAA's shape feed lists scheduled TFRs alongside
-active ones and carries no times or altitudes, so faa.py reads each nearby TFR's NOTAM text:
+active ones and carries no times or altitudes, so drones.py reads each nearby TFR's NOTAM text:
 active means NO-GO, scheduled means CAUTION with its window (e.g. "scheduled Tue Oct 27
 10:30 AM EDT to 4:00 PM EDT"), expired is dropped, and one whose text can't be fetched is
 treated as active.
@@ -107,21 +107,21 @@ treated as active.
 ### Airspace
 
 ```bash
-faa.py airspace "Chicago Midway Airport"
-faa.py airspace 41.79,-87.74 --json
-faa.py airspace "Montrose Beach" --near "Chicago, IL" --within 15
-faa.py nearby "Navy Pier, Chicago"
-faa.py nearby 38.8895,-77.0353 --radius 5
+drones.py airspace "Chicago Midway Airport"
+drones.py airspace 41.79,-87.74 --json
+drones.py airspace "Montrose Beach" --near "Chicago, IL" --within 15
+drones.py nearby "Navy Pier, Chicago"
+drones.py nearby 38.8895,-77.0353 --radius 5
 ```
 
 ### Weather
 
 ```bash
-faa.py metar "Hollywood, FL"
-faa.py metar KFLL,KMIA --max-wind 15
-faa.py taf "Hollywood, FL"
-faa.py taf KMIA --raw
-faa.py stations "Hollywood, FL" --taf-only
+drones.py metar "Hollywood, FL"
+drones.py metar KFLL,KMIA --max-wind 15
+drones.py taf "Hollywood, FL"
+drones.py taf KMIA --raw
+drones.py stations "Hollywood, FL" --taf-only
 ```
 
 ```
@@ -151,11 +151,11 @@ thunderstorms, cumulonimbus, precipitation and fog.
 ### Map
 
 ```bash
-faa.py map "Chicago Midway Airport"
-faa.py map 41.79,-87.74 --radius 5 --tiles satellite
-faa.py map "Denver, CO" --geojson > denver.geojson
-faa.py map "Navy Pier, Chicago" --radius 2 --png navy-pier.png
-faa.py map 41.79,-87.74 --png midway.png --tiles satellite --size 1920x1080
+drones.py map "Chicago Midway Airport"
+drones.py map 41.79,-87.74 --radius 5 --tiles satellite
+drones.py map "Denver, CO" --geojson > denver.geojson
+drones.py map "Navy Pier, Chicago" --radius 2 --png navy-pier.png
+drones.py map 41.79,-87.74 --png midway.png --tiles satellite --size 1920x1080
 ```
 
 Serves on `127.0.0.1`, falls back to a free port if 8765 is taken, and runs until Ctrl+C.
@@ -196,13 +196,13 @@ This project includes a `SKILL.md` file for use with AI coding agents (Claude Co
 
 ```bash
 # Create skills directory
-mkdir -p /path/to/agent/skills/faa
+mkdir -p /path/to/agent/skills/drones
 
 # Copy SKILL.md
-cp /path/to/faa.py/SKILL.md /path/to/agent/skills/faa/SKILL.md
+cp /path/to/drones.py/SKILL.md /path/to/agent/skills/drones/SKILL.md
 
-# Ensure faa.py is executable and in PATH
-chmod +x ~/.local/bin/faa.py
+# Ensure drones.py is executable and in PATH
+chmod +x ~/.local/bin/drones.py
 ```
 
 ### Usage with Claude Code

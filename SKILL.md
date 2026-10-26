@@ -1,10 +1,10 @@
 ---
-name: faa
+name: drones
 description: FAA airspace and aviation weather for drone pilots. Use when the user wants to know whether they can fly a drone somewhere (controlled airspace, LAANC ceilings, TFRs, prohibited or special use airspace, stadiums), what the current conditions or forecast are at an airport (METAR and TAF decoded to plain language), which weather stations are nearby, or a single go/no-go preflight for a place and time. Can also show the airspace on an interactive map. US only.
-compatibility: Requires 'faa.py' script in PATH. No API keys needed. Uses FAA UAS Data Delivery System (ArcGIS), tfr.faa.gov, NOAA Aviation Weather Center, and OpenStreetMap Nominatim.
+compatibility: Requires 'drones.py' script in PATH. No API keys needed. Uses FAA UAS Data Delivery System (ArcGIS), tfr.faa.gov, NOAA Aviation Weather Center, and OpenStreetMap Nominatim.
 ---
 
-# faa.py
+# drones.py
 
 Airspace and weather lookups for drone (Part 107 and recreational) flights. Every command
 takes a place name, an address, or `lat,lng` coordinates.
@@ -14,9 +14,9 @@ takes a place name, an address, or `lat,lng` coordinates.
 ### preflight - the one-call answer
 Airspace at the point plus the weather for when they plan to fly, as one verdict:
 ```bash
-faa.py preflight "Hollywood, FL"
-faa.py preflight "Hollywood Beach, FL" --at "tomorrow 7am" --max-wind 15
-faa.py preflight 41.79,-87.74 --at 2pm --altitude 200 --json
+drones.py preflight "Hollywood, FL"
+drones.py preflight "Hollywood Beach, FL" --at "tomorrow 7am" --max-wind 15
+drones.py preflight 41.79,-87.74 --at 2pm --altitude 200 --json
 ```
 
 - `--at`: `now` (default), `2pm`, `14:30`, `tomorrow 7am`, or ISO. A clock time already
@@ -34,9 +34,9 @@ faa.py preflight 41.79,-87.74 --at 2pm --altitude 200 --json
 
 ### airspace - can I fly here?
 ```bash
-faa.py airspace "Chicago Midway Airport"
-faa.py airspace 41.79,-87.74 --json
-faa.py airspace "Montrose Beach" --near "Chicago, IL" --within 15
+drones.py airspace "Chicago Midway Airport"
+drones.py airspace 41.79,-87.74 --json
+drones.py airspace "Montrose Beach" --near "Chicago, IL" --within 15
 ```
 Verdict `CLEAR`, `CAUTION`, `AUTHORIZATION REQUIRED` or `DO NOT FLY`, with surface airspace
 class, LAANC facility map ceiling and the airports/programs behind it, special use and
@@ -46,17 +46,17 @@ or "times unavailable - treat as active". Expired TFRs still in the FAA feed are
 
 ### nearby - everything within a radius
 ```bash
-faa.py nearby "Navy Pier, Chicago"
-faa.py nearby 38.8895,-77.0353 --radius 5
+drones.py nearby "Navy Pier, Chicago"
+drones.py nearby 38.8895,-77.0353 --radius 5
 ```
 Public airports, controlled airspace, LAANC grid ceilings, restrictions and stadiums within
 `--radius` NM (default 10, max 50).
 
 ### metar - current conditions, decoded
 ```bash
-faa.py metar "Hollywood, FL"
-faa.py metar KFLL,KMIA --max-wind 15
-faa.py metar KFLL --raw
+drones.py metar "Hollywood, FL"
+drones.py metar KFLL,KMIA --max-wind 15
+drones.py metar KFLL --raw
 ```
 Flight category, wind (kt and mph, gusts), visibility, weather, clouds, ceiling,
 temperature, hazards from the remarks (cumulonimbus, lightning, virga), then the drone
@@ -64,27 +64,27 @@ checks and the raw report.
 
 ### taf - forecast timeline, decoded
 ```bash
-faa.py taf "Hollywood, FL"
-faa.py taf KMIA --raw
+drones.py taf "Hollywood, FL"
+drones.py taf KMIA --raw
 ```
 One row per period in local time with a computed flight category; `↳ temporarily`,
 `↳ 30% chance` and `↳ becoming` rows are overlays on the period above them, not replacements.
 
 ### stations - who reports weather nearby
 ```bash
-faa.py stations "Hollywood, FL" --taf-only
+drones.py stations "Hollywood, FL" --taf-only
 ```
 METAR stations within `--radius` NM (default 25), nearest first, marking `METAR + TAF`.
 
 ### map - airspace on an interactive map
 ```bash
-faa.py map "Chicago Midway Airport"
-faa.py map "Denver, CO" --geojson > denver.geojson
-faa.py map "Navy Pier, Chicago" --radius 2 --png navy-pier.png
+drones.py map "Chicago Midway Airport"
+drones.py map "Denver, CO" --geojson > denver.geojson
+drones.py map "Navy Pier, Chicago" --radius 2 --png navy-pier.png
 ```
 **Blocks until interrupted** - run it in the background and report the URL it prints. Falls
 back to a free port if 8765 is taken, so read the printed URL. `--png` saves a screenshot
-instead (needs Chrome, Edge or Chromium, or set `FAA_BROWSER`); `--geojson` prints the
+instead (needs Chrome, Edge or Chromium, or set `DRONES_BROWSER`); `--geojson` prints the
 layers instead.
 
 ## Which station?
@@ -102,7 +102,7 @@ A four-letter place name that is not a station (Rome, Iowa) falls back to geocod
 
 ## Drone checks
 
-- Wind: `--max-wind KT` (default 20, or env `FAA_MAX_WIND`). Over the limit ✗, within 85%
+- Wind: `--max-wind KT` (default 20, or env `DRONES_MAX_WIND`). Over the limit ✗, within 85%
   of it ⚠. Gusts count.
 - Visibility: Part 107 minimum 3 SM.
 - Clouds: 500 ft below any cloud, so a flight to `--altitude` (default 400 ft AGL) needs bases

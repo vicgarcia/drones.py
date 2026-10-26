@@ -7,7 +7,7 @@
 # ]
 # ///
 """
-faa.py - FAA airspace and aviation weather for drone pilots.
+drones.py - FAA airspace and aviation weather for drone pilots.
 
 Answers "can I fly here?" for a place name or lat/lng: controlled airspace,
 LAANC grid ceilings, special use airspace, national security restrictions,
@@ -45,7 +45,7 @@ from geopy.geocoders import Nominatim
 from geopy.point import Point
 
 # User agent for Nominatim (required) and the FAA services
-USER_AGENT = "faa.py-cli/1.0"
+USER_AGENT = "drones.py-cli/1.0"
 
 # How many geocoding candidates to pull back so ambiguity is detectable. Same
 # single request either way, so this costs nothing against the rate limit.
@@ -94,29 +94,29 @@ ADVISORY = ("Advisory only - FAA data is not real time. Confirm with B4UFLY or a
 
 CLI_EPILOG = """\
 Examples:
-  faa.py airspace "Chicago Midway Airport"
-  faa.py airspace 41.79,-87.74
-  faa.py airspace "Montrose Beach" --near "Chicago, IL" --within 15
-  faa.py airspace "-33.86,151.21" --json
+  drones.py airspace "Chicago Midway Airport"
+  drones.py airspace 41.79,-87.74
+  drones.py airspace "Montrose Beach" --near "Chicago, IL" --within 15
+  drones.py airspace "-33.86,151.21" --json
 
-  faa.py nearby "Navy Pier, Chicago"
-  faa.py nearby 38.8895,-77.0353 --radius 5
+  drones.py nearby "Navy Pier, Chicago"
+  drones.py nearby 38.8895,-77.0353 --radius 5
 
-  faa.py map "Chicago Midway Airport"
-  faa.py map 41.79,-87.74 --radius 5 --tiles satellite
-  faa.py map "Denver, CO" --geojson > denver.geojson
-  faa.py map "Navy Pier, Chicago" --radius 2 --png navy-pier.png
-  faa.py map 41.79,-87.74 --png midway.png --tiles satellite --size 1920x1080
+  drones.py map "Chicago Midway Airport"
+  drones.py map 41.79,-87.74 --radius 5 --tiles satellite
+  drones.py map "Denver, CO" --geojson > denver.geojson
+  drones.py map "Navy Pier, Chicago" --radius 2 --png navy-pier.png
+  drones.py map 41.79,-87.74 --png midway.png --tiles satellite --size 1920x1080
 
-  faa.py metar "Hollywood, FL"
-  faa.py metar KFLL,KMIA --max-wind 15
-  faa.py taf "Hollywood, FL"
-  faa.py taf KMIA --raw
-  faa.py stations "Hollywood, FL" --taf-only
+  drones.py metar "Hollywood, FL"
+  drones.py metar KFLL,KMIA --max-wind 15
+  drones.py taf "Hollywood, FL"
+  drones.py taf KMIA --raw
+  drones.py stations "Hollywood, FL" --taf-only
 
-  faa.py preflight "Hollywood, FL"
-  faa.py preflight "Hollywood Beach, FL" --at "tomorrow 7am" --max-wind 15
-  faa.py preflight 41.79,-87.74 --at 2pm --altitude 200 --json
+  drones.py preflight "Hollywood, FL"
+  drones.py preflight "Hollywood Beach, FL" --at "tomorrow 7am" --max-wind 15
+  drones.py preflight 41.79,-87.74 --at 2pm --altitude 200 --json
 
 Location:
   Every command takes a place name, address or raw coordinates:
@@ -135,7 +135,7 @@ Weather:
   language. A place uses the nearest station that files the report: any
   METAR station for current conditions, the nearest TAF airport for the
   forecast. Drone checks apply Part 107 minimums (3 SM visibility, 500 ft
-  below clouds) and your wind limit (--max-wind, or FAA_MAX_WIND).
+  below clouds) and your wind limit (--max-wind, or DRONES_MAX_WIND).
 """
 
 
@@ -283,7 +283,7 @@ MAP_PAGE = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>faa.py - __TITLE__</title>
+<title>drones.py - __TITLE__</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
@@ -430,15 +430,15 @@ fetch('data.json')
     }
     toggleCeilings();
   })
-  .catch(err => console.error('faa.py: failed to load data.json', err));
+  .catch(err => console.error('drones.py: failed to load data.json', err));
 </script>
 </body>
 </html>
 """
 
 
-class FAAError(Exception):
-    """Base exception for faa.py errors."""
+class DronesError(Exception):
+    """Base exception for drones.py errors."""
     pass
 
 
@@ -478,7 +478,7 @@ class Locator:
         if not math.isfinite(lng) or lng < -180 or lng > 180:
             errors.append(f"Longitude {lng} out of range [-180, 180]")
         if errors:
-            raise FAAError(f"Invalid coordinates: {', '.join(errors)}")
+            raise DronesError(f"Invalid coordinates: {', '.join(errors)}")
         return lat, lng
 
     def locate(
@@ -502,7 +502,7 @@ class Locator:
             if lookup_address:
                 try:
                     address = self.reverse(lat, lng)
-                except FAAError:
+                except DronesError:
                     pass  # a name is nice to have, the coordinates are what matter
             return {"query": location, "latitude": lat, "longitude": lng, "address": address}
 
@@ -515,9 +515,9 @@ class Locator:
         result = self.geocode(location, viewbox=viewbox)
         if not result:
             if near:
-                raise FAAError(f"No results for '{location}' within "
+                raise DronesError(f"No results for '{location}' within "
                                     f"{within_miles} miles of {near}")
-            raise FAAError(f"Could not geocode: {location}")
+            raise DronesError(f"Could not geocode: {location}")
 
         _warn_if_ambiguous(result, location)
         return {"query": location, "latitude": result["latitude"],
@@ -556,7 +556,7 @@ class Locator:
                 "raw": location.raw,
             }
         except Exception as e:
-            raise FAAError(f"Geocoding failed: {e}")
+            raise DronesError(f"Geocoding failed: {e}")
 
     def reverse(self, lat: float, lng: float) -> Optional[str]:
         """Reverse geocode coordinates to an address string."""
@@ -564,7 +564,7 @@ class Locator:
             location = self._lookup("reverse", f"{lat}, {lng}")
             return location.address if location else None
         except Exception as e:
-            raise FAAError(f"Reverse geocoding failed: {e}")
+            raise DronesError(f"Reverse geocoding failed: {e}")
 
 
 def viewbox_around(lat: float, lng: float, radius_km: float) -> list:
@@ -575,7 +575,7 @@ def viewbox_around(lat: float, lng: float, radius_km: float) -> list:
     constraining the search area is the reliable fix.
     """
     if not math.isfinite(radius_km) or radius_km <= 0:
-        raise FAAError("Search radius must be a positive finite distance")
+        raise DronesError("Search radius must be a positive finite distance")
     center = Point(lat, lng)
     distance = geodesic(kilometers=radius_km)
     north = distance.destination(center, 0).latitude
@@ -650,12 +650,12 @@ class FAAClient:
                     if not throttled:
                         return data
             except requests.RequestException as e:
-                raise FAAError(f"Request to {url} failed: {e}") from e
+                raise DronesError(f"Request to {url} failed: {e}") from e
             except ValueError as e:
-                raise FAAError(f"{url} did not return JSON") from e
+                raise DronesError(f"{url} did not return JSON") from e
 
             if delay is None:
-                raise FAAError(f"{url} is rate limiting requests; try again in a minute")
+                raise DronesError(f"{url} is rate limiting requests; try again in a minute")
             time.sleep(delay)
 
     def query(
@@ -701,7 +701,7 @@ class FAAClient:
             if "error" in page:
                 error = page["error"]
                 message = error.get("message") if isinstance(error, dict) else error
-                raise FAAError(f"FAA {spec['service']} query failed: {message}")
+                raise DronesError(f"FAA {spec['service']} query failed: {message}")
 
             batch = page.get("features") or []
             features.extend(batch)
@@ -747,7 +747,7 @@ class FAAClient:
         data = self._get_json(TFR_TEXT_URL, {"notamId": notam})
         record = data[0] if isinstance(data, list) and data else data
         if not isinstance(record, dict) or not record.get("text"):
-            raise FAAError(f"No NOTAM text for TFR {notam}")
+            raise DronesError(f"No NOTAM text for TFR {notam}")
         return parse_tfr_text(record["text"])
 
 
@@ -822,7 +822,7 @@ def annotate_tfrs(faa: "FAAClient", features: list, when: Optional[datetime] = N
     def lookup(notam):
         try:
             return notam, faa.tfr_details(notam)
-        except FAAError:
+        except DronesError:
             return notam, None
 
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL_QUERIES) as pool:
@@ -1357,21 +1357,21 @@ class WeatherClient:
                 response = self.session.get(f"{AWC_URL}/{endpoint}", params=params,
                                             timeout=self.timeout)
             except requests.RequestException as e:
-                raise FAAError(f"Aviation weather request failed: {e}") from e
+                raise DronesError(f"Aviation weather request failed: {e}") from e
             if response.status_code == 204:
                 return []  # AWC's "nothing matched"
             if response.status_code != 429:
                 break
             if delay is None:
-                raise FAAError("aviationweather.gov is rate limiting requests; try again in a minute")
+                raise DronesError("aviationweather.gov is rate limiting requests; try again in a minute")
             time.sleep(delay)
         try:
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as e:
-            raise FAAError(f"Aviation weather request failed: {e}") from e
+            raise DronesError(f"Aviation weather request failed: {e}") from e
         except ValueError as e:
-            raise FAAError("aviationweather.gov did not return JSON") from e
+            raise DronesError("aviationweather.gov did not return JSON") from e
         return data if isinstance(data, list) else []
 
     def stations(self, lat: float, lng: float, radius_nm: float) -> list:
@@ -1801,15 +1801,15 @@ def parse_when(text: Optional[str], now: Optional[datetime] = None) -> datetime:
         pass
     match = re.fullmatch(r"(today|tomorrow)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", value)
     if not match:
-        raise FAAError(f"Could not read --at '{text}': try 'now', '2pm', '14:30' or 'tomorrow 7am'")
+        raise DronesError(f"Could not read --at '{text}': try 'now', '2pm', '14:30' or 'tomorrow 7am'")
     day, hour, minute, meridiem = match.groups()
     hour, minute = int(hour), int(minute or 0)
     if meridiem:
         if not 1 <= hour <= 12:
-            raise FAAError(f"Could not read --at '{text}': {hour}{meridiem} is not a time")
+            raise DronesError(f"Could not read --at '{text}': {hour}{meridiem} is not a time")
         hour = hour % 12 + (12 if meridiem == "pm" else 0)
     if hour > 23 or minute > 59:
-        raise FAAError(f"Could not read --at '{text}': no such time")
+        raise DronesError(f"Could not read --at '{text}': no such time")
     when = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if day == "tomorrow" or (day is None and when < now - timedelta(minutes=5)):
         when += timedelta(days=1)
@@ -1842,9 +1842,9 @@ def preflight(lat: float, lng: float, when: datetime, max_wind: float, altitude_
     now = now or datetime.now().astimezone()
     lead = (when - now).total_seconds() / 3600
     if lead < -1:
-        raise FAAError("--at is in the past; preflight looks at now or a coming time")
+        raise DronesError("--at is in the past; preflight looks at now or a coming time")
     if lead > 30:
-        raise FAAError("--at is more than 30 hours out, beyond any TAF")
+        raise DronesError("--at is more than 30 hours out, beyond any TAF")
 
     airspace = check_point(FAAClient(), lat, lng, when)
     client = WeatherClient()
@@ -2135,7 +2135,7 @@ def _map_server(page: str, data: dict, port: int) -> http.server.ThreadingHTTPSe
         return _MapServer(("127.0.0.1", port), Handler)
     except OSError as e:
         if port == 0:
-            raise FAAError(f"Could not start server: {e}")
+            raise DronesError(f"Could not start server: {e}")
         print(f"  Port {port} unavailable ({e.strerror}), using a free port instead")
         return _MapServer(("127.0.0.1", 0), Handler)
 
@@ -2189,8 +2189,8 @@ def _browser_paths() -> list:
 
 
 def find_browser() -> Optional[str]:
-    """Locate Chrome, Edge or Chromium. FAA_BROWSER overrides the search."""
-    override = os.environ.get("FAA_BROWSER")
+    """Locate Chrome, Edge or Chromium. DRONES_BROWSER overrides the search."""
+    override = os.environ.get("DRONES_BROWSER")
     if override:
         return override
     for command in BROWSER_COMMANDS:
@@ -2211,8 +2211,8 @@ def screenshot_map(page: str, data: dict, path: str, size: tuple[int, int],
     """
     browser = find_browser()
     if not browser:
-        raise FAAError("No Chrome, Edge or Chromium found for --png; "
-                            "install one or set FAA_BROWSER to its path")
+        raise DronesError("No Chrome, Edge or Chromium found for --png; "
+                            "install one or set DRONES_BROWSER to its path")
 
     output = os.path.abspath(path)
     if os.path.exists(output):
@@ -2238,14 +2238,14 @@ def screenshot_map(page: str, data: dict, path: str, size: tuple[int, int],
             result = subprocess.run(command, capture_output=True, text=True,
                                     timeout=wait_ms / 1000 + 90)
         except (OSError, subprocess.TimeoutExpired) as e:
-            raise FAAError(f"Browser screenshot failed: {e}") from e
+            raise DronesError(f"Browser screenshot failed: {e}") from e
         finally:
             server.shutdown()
             server.server_close()
 
     if not os.path.isfile(output):
         detail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
-        raise FAAError("Browser did not write a screenshot"
+        raise DronesError("Browser did not write a screenshot"
                             + (": " + " | ".join(detail) if detail else ""))
     return output
 
@@ -2538,7 +2538,7 @@ def _fail(message: str) -> int:
 
 def _check_radius(radius_nm: float) -> None:
     if not math.isfinite(radius_nm) or radius_nm <= 0 or radius_nm > 50:
-        raise FAAError("--radius must be between 0 and 50 NM")
+        raise DronesError("--radius must be between 0 and 50 NM")
 
 
 def _locate(args: argparse.Namespace, lookup_address: bool = True) -> dict:
@@ -2555,7 +2555,7 @@ def cmd_airspace(args: argparse.Namespace) -> int:
         else:
             print_check(location, report)
         return 0
-    except FAAError as e:
+    except DronesError as e:
         return _fail(str(e))
 
 
@@ -2571,7 +2571,7 @@ def cmd_nearby(args: argparse.Namespace) -> int:
         else:
             print_nearby(location, summary, args.radius)
         return 0
-    except FAAError as e:
+    except DronesError as e:
         return _fail(str(e))
 
 
@@ -2593,7 +2593,7 @@ def cmd_map(args: argparse.Namespace) -> int:
             return 0
         return serve_map(map_page(location, args.tiles), collection,
                          args.port, not args.no_open)
-    except FAAError as e:
+    except DronesError as e:
         return _fail(str(e))
 
 
@@ -2622,12 +2622,12 @@ def _weather_reports(args, kind: str) -> list:
     lat, lng = location["latitude"], location["longitude"]
     candidates = client.candidates(lat, lng, need_taf=(kind == "taf"))
     if not candidates:
-        raise FAAError(f"No {kind.upper()} station within {STATION_SEARCH_NM[-1]:g} NM of {query}")
+        raise DronesError(f"No {kind.upper()} station within {STATION_SEARCH_NM[-1]:g} NM of {query}")
     # Part-time TAFs and offline sensors: nearest station that actually reported
     reports = {r.get("icaoId"): r for r in fetch([c["id"] for c in candidates])}
     station = next((c for c in candidates if c["id"] in reports), None)
     if not station:
-        raise FAAError(f"None of the nearest {kind.upper()} stations "
+        raise DronesError(f"None of the nearest {kind.upper()} stations "
                        f"({', '.join(c['id'] for c in candidates)}) has a current report")
     skipped = [c["id"] for c in candidates[:candidates.index(station)]]
     if skipped:
@@ -2658,7 +2658,7 @@ def cmd_metar(args: argparse.Namespace) -> int:
             for station, location, report in results:
                 print_metar(report, station, location, args)
         return 0
-    except FAAError as e:
+    except DronesError as e:
         return _fail(str(e))
 
 
@@ -2678,7 +2678,7 @@ def cmd_taf(args: argparse.Namespace) -> int:
             for station, location, report in results:
                 print_taf(report, station, location, args)
         return 0
-    except FAAError as e:
+    except DronesError as e:
         return _fail(str(e))
 
 
@@ -2694,7 +2694,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         else:
             print_preflight(location, report, args)
         return 0 if report["verdict"] != "NO-GO" else 3
-    except FAAError as e:
+    except DronesError as e:
         return _fail(str(e))
 
 
@@ -2711,15 +2711,15 @@ def cmd_stations(args: argparse.Namespace) -> int:
         else:
             print_stations(stations, location, args.radius)
         return 0
-    except FAAError as e:
+    except DronesError as e:
         return _fail(str(e))
 
 
 def _check_limits(args: argparse.Namespace) -> None:
     if not math.isfinite(args.max_wind) or args.max_wind <= 0:
-        raise FAAError("--max-wind must be a positive number of knots")
+        raise DronesError("--max-wind must be a positive number of knots")
     if args.altitude <= 0:
-        raise FAAError("--altitude must be a positive number of feet")
+        raise DronesError("--altitude must be a positive number of feet")
 
 
 
@@ -2791,10 +2791,10 @@ def _add_limit_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-wind",
         type=float,
-        default=float(os.environ.get("FAA_MAX_WIND", DEFAULT_MAX_WIND_KT)),
+        default=float(os.environ.get("DRONES_MAX_WIND", DEFAULT_MAX_WIND_KT)),
         metavar="KT",
         help=f"Your aircraft's wind limit in knots (default: {DEFAULT_MAX_WIND_KT:g}, "
-             "or FAA_MAX_WIND)"
+             "or DRONES_MAX_WIND)"
     )
     parser.add_argument(
         "--altitude",
@@ -2823,7 +2823,7 @@ def utf8_output():
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="faa.py - FAA airspace and aviation weather for drone pilots",
+        description="drones.py - FAA airspace and aviation weather for drone pilots",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=CLI_EPILOG,
     )
