@@ -555,5 +555,80 @@ class WeatherCommandTests(OfflineCase):
         client.assert_not_called()
 
 
+class PreflightTests(OfflineCase):
+    NOW = faa.datetime(2026, 10, 25, 20, 0, tzinfo=faa.timezone.utc)
+    HERE = {"query": "here", "latitude": 26.0, "longitude": -80.2, "address": None}
+
+    def test_parse_when(self):
+        now = self.NOW
+        self.assertEqual(faa.parse_when("now", now), now)
+        self.assertEqual(faa.parse_when("9pm", now).hour, 21)
+        self.assertEqual(faa.parse_when("9pm", now).day, 25)
+        self.assertEqual(faa.parse_when("7am", now).day, 26)        # passed today -> tomorrow
+        self.assertEqual(faa.parse_when("tomorrow 7:30am", now).minute, 30)
+        self.assertEqual(faa.parse_when("12am", now).hour, 0)
+        self.assertEqual(faa.parse_when("12pm", now).hour, 12)
+        self.assertEqual(faa.parse_when("2026-10-26T14:00+00:00", now).hour, 14)
+        for bad in ["soon", "25:00", "13pm"]:
+            with self.subTest(value=bad), self.assertRaises(faa.FAAError):
+                faa.parse_when(bad, now)
+
+    def test_taf_periods_at_picks_prevailing_then_overlays(self):
+        periods = faa.taf_periods_at(KDEN_TAF, faa.datetime.fromtimestamp(1792980000, faa.timezone.utc))
+        self.assertEqual([p["fcstChange"] for p in periods], [None, "PROB"])
+        later = faa.taf_periods_at(KDEN_TAF, faa.datetime.fromtimestamp(1793010000, faa.timezone.utc))
+        self.assertEqual([p["fcstChange"] for p in later], ["TEMPO"])
+
+    def test_weather_verdict(self):
+        self.assertEqual(faa.weather_verdict([("ok", "fine")], []), ("GO", []))
+        self.assertEqual(faa.weather_verdict([("fail", "gusts")], [])[0], "NO-GO")
+        self.assertEqual(faa.weather_verdict([("ok", "x")], [("fail", "fog")]),
+                         ("CAUTION", ["possible: fog"]))
+        self.assertEqual(faa.weather_verdict([("warn", "rain")], [])[0], "CAUTION")
+
+    def run_preflight(self, airspace_report, metar, at=None):
+        client = Mock()
+        client.candidates.return_value = [{"id": "KFLL", "name": "Ft Lauderdale",
+                                           "distance_nm": 4.1, "direction": "NNE"}]
+        client.metars.return_value = [metar] if metar else []
+        client.tafs.return_value = []
+        with patch.object(faa, "check_point", return_value=airspace_report), \
+                patch.object(faa, "WeatherClient", return_value=client):
+            return faa.preflight(26.0, -80.2, at or self.NOW, 20, 400, now=self.NOW)
+
+    def airspace(self, verdict="CLEAR", ceiling=None):
+        return {"verdict": verdict, "notes": ["LAANC available up to 300 ft"],
+                "laanc": {"ceiling_ft": ceiling} if ceiling is not None else None,
+                "airspace": [], "restrictions": []}
+
+    def test_gusts_over_the_limit_are_no_go(self):
+        report = self.run_preflight(self.airspace(), KFLL_METAR)
+        self.assertEqual(report["verdict"], "NO-GO")
+        self.assertIn("gusts 22 kt over your 20 kt limit", report["reasons"])
+        self.assertEqual(report["weather"]["source"], "METAR")
+
+    def test_tfr_overrides_good_weather_and_laanc_is_a_requirement(self):
+        calm = {**KFLL_METAR, "wspd": 5, "wgst": None, "rawOb": "METAR KFLL 252353Z 04005KT 10SM CLR"}
+        self.assertEqual(self.run_preflight(self.airspace("DO NOT FLY"), calm)["verdict"], "NO-GO")
+        report = self.run_preflight(self.airspace("AUTHORIZATION REQUIRED", ceiling=300), calm)
+        self.assertEqual(report["verdict"], "GO")
+        self.assertIn("LAANC ceiling 300 ft is below your planned 400 ft", report["requirements"])
+
+    def test_time_window_is_checked(self):
+        with self.assertRaisesRegex(faa.FAAError, "30 hours"):
+            self.run_preflight(self.airspace(), KFLL_METAR, at=self.NOW + faa.timedelta(hours=40))
+
+    def test_no_go_exits_3(self):
+        no_go = {"verdict": "NO-GO", "reasons": ["gusts"], "requirements": [], "at": "2026-10-25T20:00+00:00",
+                 "airspace": self.airspace(), "weather": {"metar": None, "taf_periods": []}}
+        out = io.StringIO()
+        with patch.object(faa, "preflight", return_value=no_go), \
+                patch.object(faa, "_locate", return_value=self.HERE), \
+                patch.object(faa, "utf8_output"), contextlib.redirect_stdout(out):
+            code = faa.main(["preflight", "26.0,-80.2", "--json"])
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(out.getvalue())["verdict"], "NO-GO")
+
+
 if __name__ == "__main__":
     unittest.main()

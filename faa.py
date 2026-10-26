@@ -34,7 +34,7 @@ import time
 import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
@@ -110,6 +110,10 @@ Examples:
   faa.py taf "Hollywood, FL"
   faa.py taf KMIA --raw
   faa.py stations "Hollywood, FL" --taf-only
+
+  faa.py preflight "Hollywood, FL"
+  faa.py preflight "Hollywood Beach, FL" --at "tomorrow 7am" --max-wind 15
+  faa.py preflight 41.79,-87.74 --at 2pm --altitude 200 --json
 
 Location:
   Every command takes a place name, address or raw coordinates:
@@ -1646,6 +1650,126 @@ def decode_taf(t: dict, max_wind: float, altitude_ft: int, tz=None) -> dict:
     }
 
 
+def parse_when(text: Optional[str], now: Optional[datetime] = None) -> datetime:
+    """
+    '--at' values: now, 2pm, 14:30, 9:15am, tomorrow 7am, or an ISO time.
+
+    A bare clock time that has already passed today means tomorrow.
+    """
+    now = now or datetime.now().astimezone()
+    value = (text or "now").strip().lower()
+    if value == "now":
+        return now
+    try:
+        parsed = datetime.fromisoformat(value.upper() if "t" in value else value)
+        return parsed if parsed.tzinfo else parsed.astimezone()
+    except ValueError:
+        pass
+    match = re.fullmatch(r"(today|tomorrow)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", value)
+    if not match:
+        raise FAAError(f"Could not read --at '{text}': try 'now', '2pm', '14:30' or 'tomorrow 7am'")
+    day, hour, minute, meridiem = match.groups()
+    hour, minute = int(hour), int(minute or 0)
+    if meridiem:
+        if not 1 <= hour <= 12:
+            raise FAAError(f"Could not read --at '{text}': {hour}{meridiem} is not a time")
+        hour = hour % 12 + (12 if meridiem == "pm" else 0)
+    if hour > 23 or minute > 59:
+        raise FAAError(f"Could not read --at '{text}': no such time")
+    when = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if day == "tomorrow" or (day is None and when < now - timedelta(minutes=5)):
+        when += timedelta(days=1)
+    return when
+
+
+def taf_periods_at(taf: dict, when: datetime) -> list:
+    """The prevailing period in force at `when`, followed by any overlays covering it."""
+    moment = when.timestamp()
+    covering = [f for f in taf.get("fcsts") or []
+                if f.get("timeFrom") is not None and f["timeFrom"] <= moment < (f.get("timeTo") or 0)]
+    prevailing = [f for f in covering if f.get("fcstChange") in (None, "FM")]
+    overlays = [f for f in covering if f.get("fcstChange") not in (None, "FM")]
+    return prevailing[-1:] + overlays
+
+
+def weather_verdict(checks: list, overlay_checks: list) -> tuple[str, list]:
+    """GO / CAUTION / NO-GO from the prevailing checks; overlays can only add caution."""
+    reasons = [text for status, text in checks if status == "fail"]
+    if reasons:
+        return "NO-GO", reasons
+    possible = [f"possible: {text}" for status, text in overlay_checks if status == "fail"]
+    cautions = [text for status, text in checks + overlay_checks if status == "warn"]
+    return ("CAUTION", possible + cautions) if possible or cautions else ("GO", [])
+
+
+def preflight(lat: float, lng: float, when: datetime, max_wind: float, altitude_ft: int,
+              now: Optional[datetime] = None) -> dict:
+    """Airspace at the point plus the weather for `when`, boiled down to one verdict."""
+    now = now or datetime.now().astimezone()
+    lead = (when - now).total_seconds() / 3600
+    if lead < -1:
+        raise FAAError("--at is in the past; preflight looks at now or a coming time")
+    if lead > 30:
+        raise FAAError("--at is more than 30 hours out, beyond any TAF")
+
+    airspace = check_point(FAAClient(), lat, lng)
+    client = WeatherClient()
+    weather = {"source": None, "station": None, "metar": None, "taf_periods": []}
+
+    if lead <= 1:
+        stations = client.candidates(lat, lng, need_taf=False)
+        reports = {r.get("icaoId"): r for r in client.metars([s["id"] for s in stations])} if stations else {}
+        station = next((s for s in stations if s["id"] in reports), None)
+        if station:
+            weather.update(source="METAR", station=station,
+                           metar=decode_metar(reports[station["id"]], max_wind, altitude_ft))
+    if not weather["metar"]:
+        stations = client.candidates(lat, lng, need_taf=True)
+        reports = {r.get("icaoId"): r for r in client.tafs([s["id"] for s in stations])} if stations else {}
+        station = next((s for s in stations if s["id"] in reports), None)
+        if station:
+            covering = taf_periods_at(reports[station["id"]], when)
+            decoded = decode_taf({**reports[station["id"]], "fcsts": covering}, max_wind, altitude_ft)
+            weather.update(source="TAF", station=station, taf_periods=decoded["periods"],
+                           taf_raw=decoded["raw"])
+
+    if weather["metar"]:
+        verdict, reasons = weather_verdict(weather["metar"]["checks"], [])
+    elif weather["taf_periods"]:
+        base = [p for p in weather["taf_periods"] if not p["change"]]
+        overlays = [p for p in weather["taf_periods"] if p["change"]]
+        verdict, reasons = weather_verdict(
+            [c for p in base for c in p["checks"]], [c for p in overlays for c in p["checks"]])
+    else:
+        verdict, reasons = "CAUTION", ["no weather report available for this time and place"]
+
+    requirements = []
+    if airspace["verdict"] == "DO NOT FLY":
+        verdict = "NO-GO"
+        reasons = ["airspace: prohibited area, national defense airspace or TFR"] + reasons
+    elif airspace["verdict"] == "CAUTION" and verdict == "GO":
+        verdict = "CAUTION"
+    if airspace["verdict"] == "CAUTION":
+        reasons.append("airspace: special use or security airspace, or a stadium nearby")
+    if airspace["verdict"] == "AUTHORIZATION REQUIRED":
+        requirements.append(airspace["notes"][0])
+        ceiling = (airspace["laanc"] or {}).get("ceiling_ft")
+        if ceiling is not None and ceiling < altitude_ft:
+            requirements.append(f"LAANC ceiling {ceiling} ft is below your planned {altitude_ft} ft")
+
+    return {
+        "verdict": verdict,
+        "reasons": reasons,
+        "requirements": requirements,
+        "at": when.isoformat(timespec="minutes"),
+        "airspace_verdict": airspace["verdict"],
+        "airspace": airspace,
+        "weather": weather,
+        "limits": {"max_wind_kt": max_wind, "altitude_ft": altitude_ft},
+        "advisory": ADVISORY,
+    }
+
+
 def _epoch(iso: Optional[str]) -> Optional[float]:
     if not iso:
         return None
@@ -2200,6 +2324,50 @@ def print_taf(report: dict, station: dict, location: Optional[dict], args) -> No
     print()
 
 
+def print_preflight(location: dict, report: dict, args) -> None:
+    _header("Preflight", location)
+    when = datetime.fromisoformat(report["at"])
+    print(f"  When:       {when.strftime('%a %I:%M %p').replace(' 0', ' ')} "
+          f"({args.altitude} ft AGL, {args.max_wind:g} kt wind limit)")
+    print(f"  Verdict:    {report['verdict']}")
+    for reason in report["reasons"]:
+        print(_wrap(f"- {reason}", "              "))
+    for requirement in report["requirements"]:
+        print(_wrap(f"Requires: {requirement}", "              "))
+
+    a = report["airspace"]
+    controlled = [x for x in a["airspace"] if x["surface"]]
+    print("\n  Airspace")
+    print(f"    {a['verdict']}: " + (", ".join(f"{x['class']} {x['name']}" for x in controlled)
+                                     or "Class G (uncontrolled)"))
+    if a["laanc"]:
+        print(f"    LAANC ceiling {a['laanc']['ceiling_ft']} ft AGL")
+    for r in a["restrictions"]:
+        for line in _restriction_line(r):
+            print(line)
+
+    w = report["weather"]
+    print("\n  Weather")
+    if w["metar"]:
+        m = w["metar"]
+        print(f"    {_station_line(w['station'], location)}")
+        print(_wrap(f"Observed {m['observed']}: {m['category'] or '?'}, wind {m['wind']}, "
+                    f"visibility {m['visibility']}, clouds {m['clouds']}", "    "))
+        _print_checks(m["checks"], indent="      ")
+    elif w["taf_periods"]:
+        print(f"    TAF {_station_line(w['station'], location)}")
+        for p in w["taf_periods"]:
+            when_label = p["from"] if not p["change"] else f"\u21b3 {p['change']}"
+            print(f"    {when_label:<22} {_compact_period(p)}")
+            _print_checks([c for c in p["checks"] if c[0] != "ok"], indent=" " * 27)
+    else:
+        print("    No report available")
+
+    print(f"\n  Map:  {_maps_url(location['latitude'], location['longitude'])}")
+    print(_wrap(ADVISORY, "  "))
+    print()
+
+
 def print_stations(stations: list, location: dict, radius_nm: float) -> None:
     print(f"\n  Weather stations within {radius_nm:g} NM of {location['query']}")
     print("  " + "=" * 58)
@@ -2367,6 +2535,22 @@ def cmd_taf(args: argparse.Namespace) -> int:
         return _fail(str(e))
 
 
+def cmd_preflight(args: argparse.Namespace) -> int:
+    try:
+        _check_limits(args)
+        when = parse_when(args.at)
+        location = _locate(args, lookup_address=not args.no_address)
+        report = preflight(location["latitude"], location["longitude"], when,
+                           args.max_wind, args.altitude)
+        if args.json:
+            print(json.dumps({"location": location, **report}, indent=2))
+        else:
+            print_preflight(location, report, args)
+        return 0 if report["verdict"] != "NO-GO" else 3
+    except FAAError as e:
+        return _fail(str(e))
+
+
 def cmd_stations(args: argparse.Namespace) -> int:
     try:
         _check_radius(args.radius)
@@ -2453,6 +2637,24 @@ def _add_location_options(parser: argparse.ArgumentParser) -> None:
         "--no-address",
         action="store_true",
         help="Skip the reverse lookup that names raw coordinates"
+    )
+
+
+def _add_limit_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--max-wind",
+        type=float,
+        default=float(os.environ.get("FAA_MAX_WIND", DEFAULT_MAX_WIND_KT)),
+        metavar="KT",
+        help=f"Your aircraft's wind limit in knots (default: {DEFAULT_MAX_WIND_KT:g}, "
+             "or FAA_MAX_WIND)"
+    )
+    parser.add_argument(
+        "--altitude",
+        type=int,
+        default=400,
+        metavar="FT",
+        help="Planned height in ft AGL for the cloud clearance check (default: 400)"
     )
 
 
@@ -2551,23 +2753,26 @@ def build_parser() -> argparse.ArgumentParser:
                         f"place, which uses the nearest {kind}-reporting station."
         )
         _add_location_options(weather_parser)
-        weather_parser.add_argument(
-            "--max-wind",
-            type=float,
-            default=float(os.environ.get("FAA_MAX_WIND", DEFAULT_MAX_WIND_KT)),
-            metavar="KT",
-            help=f"Your aircraft's wind limit in knots (default: {DEFAULT_MAX_WIND_KT:g}, "
-                 "or FAA_MAX_WIND)"
-        )
-        weather_parser.add_argument(
-            "--altitude",
-            type=int,
-            default=400,
-            metavar="FT",
-            help="Planned height in ft AGL for the cloud clearance check (default: 400)"
-        )
+        _add_limit_options(weather_parser)
         weather_parser.add_argument("--raw", action="store_true", help="Print only the raw report")
         weather_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="Go/no-go: airspace plus weather for when you plan to fly",
+        description="Airspace at the point and the weather for --at, as one verdict. "
+                    "Within the hour uses the nearest METAR; later uses the nearest TAF. "
+                    "Exits 3 on NO-GO."
+    )
+    _add_location_options(preflight_parser)
+    _add_limit_options(preflight_parser)
+    preflight_parser.add_argument(
+        "--at",
+        default="now",
+        metavar="TIME",
+        help="When you plan to fly: now, 2pm, 14:30, 'tomorrow 7am' or ISO (default: now)"
+    )
+    preflight_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
 
     stations_parser = subparsers.add_parser(
         "stations",
@@ -2601,6 +2806,7 @@ def main(argv: Optional[list] = None) -> int:
         "metar": cmd_metar,
         "taf": cmd_taf,
         "stations": cmd_stations,
+        "preflight": cmd_preflight,
     }
     handler = commands.get(args.command)
     if handler:
