@@ -381,5 +381,179 @@ class CommandTests(OfflineCase):
         self.assertIn("--radius", err.getvalue())
 
 
+# Real AWC records (Ft Lauderdale, 2026-10-25), trimmed to the fields used
+KFLL_METAR = {
+    "icaoId": "KFLL", "obsTime": 1792972380, "temp": 25, "dewp": 20.6,
+    "wdir": 40, "wspd": 13, "wgst": 22, "visib": "10+", "fltCat": "VFR",
+    "name": "Ft Lauderdale-Hollywood Intl, FL, US",
+    "clouds": [{"cover": "SCT", "base": 2600}, {"cover": "BKN", "base": 3600},
+               {"cover": "BKN", "base": 9000}],
+    "rawOb": "METAR KFLL 252353Z 04013G22KT 10SM SCT026CB BKN036 BKN090 25/21 A2993 "
+             "RMK AO2 RAE16B33E43 SLP135 CB ALQDS MOV SW P0001 60003 T02500206 10278 20239 53002 $",
+}
+KDEN_TAF = {
+    "icaoId": "KDEN", "name": "Denver Intl", "issueTime": "2026-10-25T23:33:00.000Z",
+    "validTimeFrom": 1792972800, "validTimeTo": 1793080800, "rawTAF": "TAF KDEN ...",
+    "fcsts": [
+        {"timeFrom": 1792972800, "timeTo": 1792990800, "fcstChange": None, "probability": None,
+         "wdir": 330, "wspd": 12, "wgst": None, "visib": "6+", "wxString": None,
+         "clouds": [{"cover": "SCT", "base": 6000}, {"cover": "BKN", "base": 9000}]},
+        {"timeFrom": 1792976400, "timeTo": 1792990800, "fcstChange": "PROB", "probability": 30,
+         "wdir": None, "wspd": None, "wgst": None, "visib": "", "wxString": "-SHRA",
+         "clouds": [{"cover": "BKN", "base": 4000}]},
+        {"timeFrom": 1793008800, "timeTo": 1793023200, "fcstChange": "TEMPO", "probability": None,
+         "wdir": None, "wspd": None, "wgst": None, "visib": "3/4", "wxString": "BR",
+         "clouds": [{"cover": "OVC", "base": 200}]},
+    ],
+}
+
+
+def station(ident, lat, lon, kinds=("METAR", "TAF"), name=None):
+    return {"icaoId": ident, "site": name or ident, "state": "FL", "lat": lat, "lon": lon,
+            "siteType": list(kinds), "elev": 3}
+
+
+class WeatherDecodeTests(OfflineCase):
+    def test_metar_decodes_to_plain_language(self):
+        report = faa.decode_metar(KFLL_METAR, max_wind=20, altitude_ft=400,
+                                  tz=faa.timezone.utc, now=1792972380 + 420)
+        self.assertEqual(report["wind"], "NE 40° at 13 kt (15 mph), gusting 22 kt (25 mph)")
+        self.assertEqual(report["visibility"], "10+ statute miles")
+        self.assertEqual(report["ceiling_ft"], 3600)
+        self.assertEqual(report["category"], "VFR")
+        self.assertEqual(report["observed"], "11:53 PM UTC (23:53Z)")
+        self.assertEqual(report["age_minutes"], 7)
+        self.assertEqual(report["temperature"], "25°C (77°F)")
+
+    def test_cumulonimbus_recovered_from_raw_report(self):
+        # AWC's JSON drops the CB on SCT026CB; the raw report keeps it
+        report = faa.decode_metar(KFLL_METAR, 20, 400)
+        self.assertEqual(report["cloud_layers"][0], {"cover": "SCT", "base_ft": 2600, "type": "CB"})
+        self.assertIn("scattered 2,600 ft (cumulonimbus)", report["clouds"])
+        self.assertEqual(report["hazards"], ["cumulonimbus in all quadrants, moving SW"])
+        statuses = dict((text, status) for status, text in report["checks"])
+        self.assertEqual(statuses["gusts 22 kt over your 20 kt limit"], "fail")
+        self.assertEqual(statuses["cumulonimbus nearby"], "warn")
+
+    def test_wind_limit_margin_and_calm(self):
+        def wind_check(speed, gust, limit=20):
+            return faa.drone_checks(speed, gust, 10, [], [], [], limit, 400)[0]
+        self.assertEqual(wind_check(8, 20)[0], "warn")      # at the limit
+        self.assertEqual(wind_check(8, 21)[0], "fail")
+        self.assertEqual(wind_check(5, None), ("ok", "wind 5 kt within your 20 kt limit"))
+        self.assertEqual(faa.describe_wind(0, 0, None), "calm")
+        self.assertEqual(faa.describe_wind("VRB", 4, None), "variable at 4 kt (5 mph)")
+
+    def test_cloud_clearance_uses_altitude_plus_500(self):
+        broken = [{"cover": "BKN", "base_ft": 800, "type": None}]
+        scattered = [{"cover": "SCT", "base_ft": 800, "type": None}]
+        self.assertEqual(faa.drone_checks(5, None, 10, broken, [], [], 20, 400)[2][0], "fail")
+        self.assertEqual(faa.drone_checks(5, None, 10, broken, [], [], 20, 200)[2][0], "ok")
+        self.assertEqual(faa.drone_checks(5, None, 10, scattered, [], [], 20, 400)[2][0], "warn")
+        self.assertEqual(faa.drone_checks(5, None, 2.5, [], [], [], 20, 400)[1][0], "fail")
+
+    def test_present_weather_codes(self):
+        self.assertEqual(faa.describe_weather("-SHRA BR VCSH VCTS +TSRA FZFG"), [
+            "light rain showers", "mist", "showers in the vicinity",
+            "thunderstorm in the vicinity", "heavy thunderstorm with rain", "freezing fog"])
+        self.assertEqual(faa.describe_weather(None), [])
+
+    def test_visibility_and_flight_category(self):
+        self.assertEqual(faa._number("1 1/2"), 1.5)
+        self.assertEqual(faa._number("6+"), 6)
+        self.assertIsNone(faa._number(""))
+        self.assertEqual(faa.describe_visibility("1/2"), "1/2 statute miles")
+        self.assertEqual(faa.flight_category(3600, 10), "VFR")
+        self.assertEqual(faa.flight_category(2500, 10), "MVFR")
+        self.assertEqual(faa.flight_category(None, 2), "IFR")
+        self.assertEqual(faa.flight_category(200, 0.75), "LIFR")
+
+    def test_taf_overlays_are_labelled_not_replacements(self):
+        report = faa.decode_taf(KDEN_TAF, 20, 400, tz=faa.timezone.utc)
+        base, chance, tempo = report["periods"]
+        self.assertIsNone(base["change"])
+        self.assertEqual(chance["change"], "30% chance")
+        self.assertIsNone(chance["visibility"])  # '' means unchanged, not missing
+        self.assertEqual(chance["weather"], ["light rain showers"])
+        self.assertEqual(tempo["change"], "temporarily")
+        self.assertEqual(tempo["category"], "LIFR")
+        # Overlays only list what changes, so no "wind not reported" noise
+        self.assertFalse([c for c in chance["checks"] if "not reported" in c[1]])
+        self.assertIn(("fail", "visibility 0.75 SM below the 3 SM minimum"), tempo["checks"])
+
+
+class WeatherClientTests(OfflineCase):
+    def setUp(self):
+        super().setUp()
+        self.client = faa.WeatherClient()
+        self.client._get = Mock()
+
+    def test_stations_drop_sensors_and_sort_by_distance(self):
+        self.client._get.return_value = [
+            station("KFLL", 26.0787, -80.1622), station("KPMP", 26.2464, -80.1110, ("METAR",)),
+            station("PVGF1", 26.092, -80.109, ()), station("KHWO", 25.9996, -80.2412)]
+        found = self.client.stations(26.0112, -80.1495, 20)
+        self.assertEqual([s["id"] for s in found], ["KFLL", "KHWO", "KPMP"])
+        self.assertEqual([s["has_taf"] for s in found], [True, True, False])
+        self.assertEqual(self.client._get.call_args.args[0], "stationinfo")
+
+    def test_candidates_widen_until_a_taf_station_appears(self):
+        self.client._get.side_effect = [
+            [station("KPMP", 26.2464, -80.1110, ("METAR",))],
+            [station("KPMP", 26.2464, -80.1110, ("METAR",)), station("KFLL", 26.0787, -80.1622)]]
+        found = self.client.candidates(26.0112, -80.1495, need_taf=True)
+        self.assertEqual([s["id"] for s in found], ["KFLL"])
+        self.assertEqual(self.client._get.call_count, 2)
+
+    def test_no_content_and_throttling(self):
+        client = faa.WeatherClient()
+        client.session = Mock()
+        client.session.get.return_value = Mock(status_code=204)
+        self.assertEqual(client._get("metar", ids="XXXX"), [])
+        client.session.get.return_value = Mock(status_code=429)
+        with patch.object(faa.time, "sleep"), self.assertRaisesRegex(faa.FAAError, "rate limiting"):
+            client._get("metar", ids="KFLL")
+
+
+class WeatherCommandTests(OfflineCase):
+    def run_cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                patch.object(faa, "utf8_output"):
+            code = faa.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_station_ids_keep_the_requested_order(self):
+        client = Mock()
+        client.metars.return_value = [{**KFLL_METAR, "icaoId": "KDEN"}, KFLL_METAR]
+        with patch.object(faa, "WeatherClient", return_value=client):
+            code, out, _ = self.run_cli("metar", "kfll,kden", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual([r["metar"]["station"] for r in json.loads(out)], ["KFLL", "KDEN"])
+        client.metars.assert_called_once_with(["KFLL", "KDEN"])
+
+    def test_place_uses_nearest_station_that_reported(self):
+        client = Mock()
+        client.candidates.return_value = [
+            {"id": "KHWO", "name": "North Perry", "distance_nm": 3.0, "direction": "WSW"},
+            {"id": "KFLL", "name": "Ft Lauderdale", "distance_nm": 4.1, "direction": "NNE"}]
+        client.tafs.return_value = [{**KDEN_TAF, "icaoId": "KFLL"}]  # KHWO is part time
+        with patch.object(faa, "WeatherClient", return_value=client), \
+                patch.object(faa, "_locate", return_value={"query": "here", "latitude": 26.0,
+                                                           "longitude": -80.2, "address": None}):
+            code, out, err = self.run_cli("taf", "Hollywood, FL", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["station"]["id"], "KFLL")
+        self.assertIn("KHWO has no current TAF; using KFLL", err)
+        client.tafs.assert_called_once_with(["KHWO", "KFLL"])
+
+    def test_bad_limits_fail_before_any_request(self):
+        with patch.object(faa, "WeatherClient") as client:
+            code, _, err = self.run_cli("metar", "KFLL", "--max-wind", "0")
+        self.assertEqual(code, 1)
+        self.assertIn("--max-wind", err)
+        client.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

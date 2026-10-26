@@ -34,6 +34,7 @@ import time
 import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -57,6 +58,18 @@ AMBIGUITY_RATIO = 0.85
 FAA_SERVICES = "https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services"
 TFR_SHAPES_URL = "https://tfr.faa.gov/geoserver/TFR/ows"
 TFR_DETAIL_URL = "https://tfr.faa.gov/tfr3/?page=detail_{}"
+
+# NOAA Aviation Weather Center data API (METAR, TAF, station index)
+AWC_URL = "https://aviationweather.gov/api/data"
+# Widening rings for "nearest station": most US points find a METAR in the
+# first, while TAF airports are sparser and can sit 50+ NM away out west
+STATION_SEARCH_NM = (15, 30, 60, 120)
+DEFAULT_STATION_RADIUS_NM = 25.0
+# A TAF officially covers 5 SM around its airport; past this, call it regional
+TAF_COVERAGE_NM = 10
+DEFAULT_MAX_WIND_KT = 20.0
+# Wind at this share of the limit or more is flagged as close
+WIND_MARGIN = 0.85
 
 # Seconds to wait between retries when a service throttles us
 RETRY_DELAYS = (2, 5, 10)
@@ -92,6 +105,12 @@ Examples:
   faa.py map "Navy Pier, Chicago" --radius 2 --png navy-pier.png
   faa.py map 41.79,-87.74 --png midway.png --tiles satellite --size 1920x1080
 
+  faa.py metar "Hollywood, FL"
+  faa.py metar KFLL,KMIA --max-wind 15
+  faa.py taf "Hollywood, FL"
+  faa.py taf KMIA --raw
+  faa.py stations "Hollywood, FL" --taf-only
+
 Location:
   Every command takes a place name, address or raw coordinates:
     "41.79,-87.74"         Raw lat,lng (comma or space separated)
@@ -103,6 +122,13 @@ Data:
   prohibited areas, national defense airspace, part-time national security
   UAS restrictions, stadiums, recreational flyer fixed sites, airports, and
   TFR shapes from tfr.faa.gov. Distances are nautical miles (NM).
+
+Weather:
+  METAR and TAF from NOAA's Aviation Weather Center, decoded to plain
+  language. A place uses the nearest station that files the report: any
+  METAR station for current conditions, the nearest TAF airport for the
+  forecast. Drone checks apply Part 107 minimums (3 SM visibility, 500 ft
+  below clouds) and your wind limit (--max-wind, or FAA_MAX_WIND).
 """
 
 
@@ -1169,6 +1195,467 @@ def summarize_survey(data: dict, lat: float, lng: float) -> dict:
 
 
 # ============================================================================
+# Aviation weather (NOAA Aviation Weather Center)
+# ============================================================================
+
+class WeatherClient:
+    """
+    Read-only client for aviationweather.gov's data API.
+
+    METAR observations and TAF forecasts, plus the station index that says
+    which stations issue which. One narrow request per lookup keeps well under
+    the API's 100 requests a minute.
+    """
+
+    def __init__(self, timeout: float = 30):
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
+
+    def _get(self, endpoint: str, **params) -> list:
+        params["format"] = "json"
+        for delay in RETRY_DELAYS + (None,):
+            try:
+                response = self.session.get(f"{AWC_URL}/{endpoint}", params=params,
+                                            timeout=self.timeout)
+            except requests.RequestException as e:
+                raise FAAError(f"Aviation weather request failed: {e}") from e
+            if response.status_code == 204:
+                return []  # AWC's "nothing matched"
+            if response.status_code != 429:
+                break
+            if delay is None:
+                raise FAAError("aviationweather.gov is rate limiting requests; try again in a minute")
+            time.sleep(delay)
+        try:
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as e:
+            raise FAAError(f"Aviation weather request failed: {e}") from e
+        except ValueError as e:
+            raise FAAError("aviationweather.gov did not return JSON") from e
+        return data if isinstance(data, list) else []
+
+    def stations(self, lat: float, lng: float, radius_nm: float) -> list:
+        """METAR-reporting stations within radius_nm, nearest first, each with has_taf."""
+        dlat = radius_nm / 60
+        dlng = radius_nm / (60 * max(math.cos(math.radians(lat)), 0.01))
+        bbox = f"{lat - dlat:.4f},{lng - dlng:.4f},{lat + dlat:.4f},{lng + dlng:.4f}"
+        found = []
+        for s in self._get("stationinfo", bbox=bbox):
+            kinds = s.get("siteType") or []
+            if "METAR" not in kinds or s.get("lat") is None or s.get("lon") is None:
+                continue  # buoys and other sensors that file neither report
+            distance = geodesic((lat, lng), (s["lat"], s["lon"])).km / KM_PER_NM
+            if distance > radius_nm:
+                continue  # the bbox corners reach past the circle
+            bearing = calculate_bearing(lat, lng, s["lat"], s["lon"])
+            found.append({
+                "id": s.get("icaoId") or s.get("id"),
+                "name": s.get("site"),
+                "state": s.get("state"),
+                "latitude": s["lat"],
+                "longitude": s["lon"],
+                "elevation_m": s.get("elev"),
+                "has_taf": "TAF" in kinds,
+                "distance_nm": round(distance, 1),
+                "bearing": bearing,
+                "direction": bearing_to_cardinal(bearing),
+            })
+        return sorted(found, key=lambda s: s["distance_nm"])
+
+    def candidates(self, lat: float, lng: float, need_taf: bool, limit: int = 5) -> list:
+        """The closest METAR (or TAF) stations, widening the search until some turn up."""
+        for radius in STATION_SEARCH_NM:
+            found = [s for s in self.stations(lat, lng, radius) if s["has_taf"] or not need_taf]
+            if found:
+                return found[:limit]
+        return []
+
+    def metars(self, ids: list) -> list:
+        return self._get("metar", ids=",".join(ids))
+
+    def tafs(self, ids: list) -> list:
+        return self._get("taf", ids=",".join(ids))
+
+
+CLOUD_COVER = {
+    "SKC": "clear", "CLR": "clear", "NCD": "no clouds detected", "NSC": "no significant clouds",
+    "CAVOK": "ceiling and visibility OK", "FEW": "few", "SCT": "scattered",
+    "BKN": "broken", "OVC": "overcast", "OVX": "sky obscured",
+}
+CLOUD_TYPES = {"CB": "cumulonimbus", "TCU": "towering cumulus"}
+CEILING_COVERS = {"BKN", "OVC", "OVX"}
+
+# METAR/TAF present-weather codes, in the order a group is written
+WX_INTENSITY = {"-": "light", "+": "heavy"}
+WX_DESCRIPTORS = {
+    "MI": "shallow", "PR": "partial", "BC": "patches of", "DR": "low drifting",
+    "BL": "blowing", "SH": "showers of", "TS": "thunderstorm with", "FZ": "freezing",
+}
+WX_PHENOMENA = {
+    "DZ": "drizzle", "RA": "rain", "SN": "snow", "SG": "snow grains", "IC": "ice crystals",
+    "PL": "ice pellets", "GR": "hail", "GS": "small hail", "UP": "unknown precipitation",
+    "BR": "mist", "FG": "fog", "FU": "smoke", "VA": "volcanic ash", "DU": "dust",
+    "SA": "sand", "HZ": "haze", "PY": "spray", "PO": "dust whirls", "SQ": "squalls",
+    "FC": "funnel cloud", "SS": "sandstorm", "DS": "duststorm",
+}
+# Descriptors that also stand alone, as in VCSH or VCTS
+WX_ALONE = {"SH": "showers", "TS": "thunderstorm"}
+WX_GROUP = re.compile(r"^(?P<intensity>[-+]?)(?P<vicinity>VC)?(?P<body>[A-Z]+)$")
+
+FLIGHT_CATEGORIES = {
+    "VFR": "visual flight rules",
+    "MVFR": "marginal VFR",
+    "IFR": "instrument flight rules",
+    "LIFR": "low IFR",
+}
+TAF_CHANGES = {"FM": "from", "TEMPO": "temporarily", "BECMG": "becoming", "PROB": "chance"}
+
+
+def _number(value) -> Optional[float]:
+    """AWC visibility arrives as 10, 0.5, '1/2' or '10+'; ceilings and winds as numbers."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().rstrip("+")
+    try:
+        if " " in text:
+            whole, fraction = text.split(" ", 1)
+            return float(whole) + _number(fraction)
+        if "/" in text:
+            top, bottom = text.split("/", 1)
+            return float(top) / float(bottom)
+        return float(text)
+    except (ValueError, ZeroDivisionError, TypeError):
+        return None
+
+
+def knots_to_mph(knots: float) -> int:
+    return round(knots * 1.15078)
+
+
+def describe_wind(wdir, wspd, wgst) -> str:
+    """'NE 40° at 13 kt (15 mph), gusting 22 kt (25 mph)', 'variable at 3 kt' or 'calm'."""
+    speed = _number(wspd)
+    if speed is None:
+        return "not reported"
+    if speed == 0:
+        return "calm"
+    if wdir in (None, "", "VRB"):
+        where = "variable"
+    else:
+        degrees = int(_number(wdir) or 0)
+        where = f"{bearing_to_cardinal(degrees)} {degrees}°"
+    text = f"{where} at {int(speed)} kt ({knots_to_mph(speed)} mph)"
+    gust = _number(wgst)
+    if gust:
+        text += f", gusting {int(gust)} kt ({knots_to_mph(gust)} mph)"
+    return text
+
+
+def describe_visibility(visib) -> str:
+    miles = _number(visib)
+    if miles is None:
+        return "not reported"
+    plus = str(visib).strip().endswith("+")
+    shown = f"{miles:g}" if miles >= 1 or not miles else str(visib).strip()
+    unit = "statute mile" if miles == 1 and not plus else "statute miles"
+    return f"{shown}{'+' if plus else ''} {unit}"
+
+
+def describe_weather(wx: Optional[str]) -> list:
+    """Decode a present-weather string like '-SHRA BR VCTS' into phrases."""
+    phrases = []
+    for group in (wx or "").split():
+        match = WX_GROUP.match(group)
+        if not match:
+            phrases.append(group)
+            continue
+        body, words = match["body"], []
+        while body:
+            code = body[:2]
+            if code in WX_DESCRIPTORS and len(body) > 2:
+                words.append(WX_DESCRIPTORS[code])
+            elif code in WX_PHENOMENA:
+                words.append(WX_PHENOMENA[code])
+            elif code in WX_ALONE:
+                words.append(WX_ALONE[code])
+            else:
+                words.append(body)
+                break
+            body = body[2:]
+        if words and words[-1].endswith(" of"):
+            words[-1] = words[-1][:-3]  # 'showers of' with nothing after reads as 'showers'
+        if words and words[-1].endswith(" with"):
+            words[-1] = words[-1][:-5]
+        phrase = " ".join(words).replace("showers of rain", "rain showers").replace(
+            "showers of snow", "snow showers")
+        if match["intensity"]:
+            phrase = f"{WX_INTENSITY[match['intensity']]} {phrase}"
+        if match["vicinity"]:
+            phrase += " in the vicinity"
+        phrases.append(phrase)
+    return phrases
+
+
+def cloud_types_from_raw(raw: str) -> dict:
+    """
+    Cumulonimbus/towering cumulus tags by cloud base, from the raw report.
+
+    AWC's METAR JSON drops the CB/TCU suffix (SCT026CB arrives as plain SCT
+    2600), and it is the one cloud detail that matters most to a drone pilot.
+    """
+    report = (raw or "").split(" RMK ")[0]
+    return {int(base) * 100: kind for _, base, kind in
+            re.findall(r"\b(FEW|SCT|BKN|OVC)(\d{3})(CB|TCU)\b", report)}
+
+
+def cloud_layers(clouds: list, raw: Optional[str] = None, vertical_visibility=None) -> list:
+    layers = []
+    types = cloud_types_from_raw(raw) if raw else {}
+    for c in clouds or []:
+        cover = c.get("cover")
+        base = _number(c.get("base"))
+        kind = c.get("type") or (types.get(int(base)) if base is not None else None)
+        layers.append({"cover": cover, "base_ft": None if base is None else int(base), "type": kind})
+    vv = _number(vertical_visibility)
+    if vv is not None and not any(layer["cover"] == "OVX" for layer in layers):
+        layers.append({"cover": "OVX", "base_ft": int(vv), "type": None})
+    return layers
+
+
+def describe_clouds(layers: list) -> str:
+    if not layers:
+        return "not reported"
+    parts = []
+    for layer in layers:
+        text = CLOUD_COVER.get(layer["cover"], layer["cover"] or "?")
+        if layer["base_ft"] is not None and layer["cover"] not in ("SKC", "CLR", "NCD", "NSC"):
+            text += f" {layer['base_ft']:,} ft"
+        if layer["type"]:
+            text += f" ({CLOUD_TYPES.get(layer['type'], layer['type'])})"
+        parts.append(text)
+    return ", ".join(parts)
+
+
+def ceiling_ft(layers: list) -> Optional[int]:
+    """Lowest broken, overcast or obscured layer; None means no ceiling."""
+    bases = [l["base_ft"] for l in layers if l["cover"] in CEILING_COVERS and l["base_ft"] is not None]
+    return min(bases) if bases else None
+
+
+def flight_category(ceiling: Optional[int], visibility: Optional[float]) -> Optional[str]:
+    """The standard cutoffs; the worse of ceiling and visibility decides."""
+    if visibility is None and ceiling is None:
+        return None
+    ranks = []
+    if ceiling is not None:
+        ranks.append(0 if ceiling < 500 else 1 if ceiling < 1000 else 2 if ceiling <= 3000 else 3)
+    if visibility is not None:
+        ranks.append(0 if visibility < 1 else 1 if visibility < 3 else 2 if visibility <= 5 else 3)
+    return ["LIFR", "IFR", "MVFR", "VFR"][min(ranks)]
+
+
+def remark_hazards(raw: Optional[str]) -> list:
+    """Hazards a drone pilot should hear about that live in a METAR's remarks."""
+    remarks = (raw or "").split(" RMK ", 1)[1] if " RMK " in (raw or "") else ""
+    hazards = []
+    cb = re.search(r"\b(CB|TCU)\b(?:\s+(ALQDS|DSNT|VC|OHD|[NSEW]{1,3}(?:-[NSEW]{1,3})*))?"
+                   r"(?:\s+MOV\s+([NSEW]{1,3}))?", remarks)
+    if cb:
+        kind, where, moving = cb.groups()
+        text = CLOUD_TYPES[kind]
+        text += {"ALQDS": " in all quadrants", "DSNT": " in the distance", "VC": " in the vicinity",
+                 "OHD": " overhead", None: " reported"}.get(where, f" to the {where}")
+        if moving:
+            text += f", moving {moving}"
+        hazards.append(text)
+    if re.search(r"\bLTG", remarks):
+        hazards.append("lightning observed")
+    if re.search(r"\bVIRGA\b", remarks):
+        hazards.append("virga (rain not reaching the ground)")
+    if re.search(r"\bTS\b|TSB\d|TSE\d", remarks) and not any("thunder" in h for h in hazards):
+        hazards.append("thunderstorm noted in remarks")
+    return hazards
+
+
+def local_time(epoch: Optional[float], tz=None) -> Optional[str]:
+    """'7:53 PM EDT (23:53Z)' in the viewer's time zone, or tz when given."""
+    if epoch is None:
+        return None
+    utc = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    here = utc.astimezone(tz)
+    name = here.tzname() or ""
+    if " " in name:  # Windows says 'Eastern Daylight Time'
+        name = "".join(word[0] for word in name.split())
+    clock = here.strftime("%I:%M %p").lstrip("0")
+    return f"{clock} {name} ({utc:%H:%M}Z)".replace("  ", " ")
+
+
+def local_span(start: Optional[float], end: Optional[float], tz=None) -> str:
+    def short(epoch):
+        here = datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone(tz)
+        return here.strftime("%a %I %p").replace(" 0", " ")
+    if start is None:
+        return "?"
+    return f"{short(start)} - {short(end)}" if end else short(start)
+
+
+def drone_checks(wind_kt, gust_kt, visibility, layers, weather: list, hazards: list,
+                 max_wind: float, altitude_ft: int) -> list:
+    """
+    Part 107 weather minimums and the pilot's wind limit, as (status, text) rows.
+
+    Visibility must be 3 statute miles and the aircraft 500 ft below any cloud,
+    so a flight to altitude_ft needs cloud bases at altitude_ft + 500 or above.
+    """
+    checks = []
+    peak = max(_number(wind_kt) or 0, _number(gust_kt) or 0)
+    kind = "gusts" if (_number(gust_kt) or 0) > (_number(wind_kt) or 0) else "wind"
+    if _number(wind_kt) is None:
+        checks.append(("warn", "wind not reported"))
+    elif peak > max_wind:
+        checks.append(("fail", f"{kind} {int(peak)} kt over your {max_wind:g} kt limit"))
+    elif peak >= max_wind * WIND_MARGIN:
+        checks.append(("warn", f"{kind} {int(peak)} kt near your {max_wind:g} kt limit"))
+    else:
+        checks.append(("ok", f"{kind} {int(peak)} kt within your {max_wind:g} kt limit"))
+
+    if visibility is None:
+        checks.append(("warn", "visibility not reported"))
+    elif visibility < 3:
+        checks.append(("fail", f"visibility {visibility:g} SM below the 3 SM minimum"))
+    else:
+        checks.append(("ok", "visibility meets 3 SM"))
+
+    needed = altitude_ft + 500
+    low = [l for l in layers if l["base_ft"] is not None and l["cover"] not in ("SKC", "CLR", "NCD", "NSC")]
+    lowest = min(low, key=lambda l: l["base_ft"]) if low else None
+    if lowest is None or lowest["base_ft"] >= needed:
+        checks.append(("ok", f"clouds clear of {altitude_ft} ft + 500 ft"))
+    elif lowest["cover"] in CEILING_COVERS:
+        checks.append(("fail", f"{CLOUD_COVER[lowest['cover']]} clouds at {lowest['base_ft']:,} ft; "
+                               f"a {altitude_ft} ft flight needs {needed:,} ft"))
+    else:
+        checks.append(("warn", f"{CLOUD_COVER[lowest['cover']]} clouds at {lowest['base_ft']:,} ft; "
+                               f"stay 500 ft below them"))
+
+    if any("thunderstorm" in w for w in weather):
+        checks.append(("fail", "thunderstorms"))
+    if any(l["type"] == "CB" for l in layers) or any("cumulonimbus" in h for h in hazards):
+        checks.append(("warn", "cumulonimbus nearby"))
+    precipitation = [w for w in weather if any(p in w for p in ("rain", "drizzle", "snow", "hail", "ice"))]
+    if precipitation:
+        checks.append(("warn", ", ".join(precipitation)))
+    if any(w in ("fog", "mist", "haze", "smoke") or "fog" in w for w in weather):
+        checks.append(("warn", "reduced visibility (" + ", ".join(
+            w for w in weather if w in ("fog", "mist", "haze", "smoke") or "fog" in w) + ")"))
+    return checks
+
+
+def decode_metar(m: dict, max_wind: float, altitude_ft: int, tz=None, now: Optional[float] = None) -> dict:
+    """A METAR record from AWC, in plain language plus the drone checks."""
+    raw = m.get("rawOb")
+    layers = cloud_layers(m.get("clouds"), raw=raw, vertical_visibility=m.get("vertVis"))
+    visibility = _number(m.get("visib"))
+    weather = describe_weather(m.get("wxString"))
+    hazards = remark_hazards(raw)
+    ceiling = ceiling_ft(layers)
+    observed = m.get("obsTime")
+    now = time.time() if now is None else now
+    temp, dew = _number(m.get("temp")), _number(m.get("dewp"))
+    return {
+        "station": m.get("icaoId"),
+        "name": m.get("name"),
+        "observed": local_time(observed, tz),
+        "observed_utc": datetime.fromtimestamp(observed, tz=timezone.utc).isoformat() if observed else None,
+        "age_minutes": None if observed is None else max(0, round((now - observed) / 60)),
+        "category": m.get("fltCat") or flight_category(ceiling, visibility),
+        "wind": describe_wind(m.get("wdir"), m.get("wspd"), m.get("wgst")),
+        "wind_kt": _number(m.get("wspd")),
+        "gust_kt": _number(m.get("wgst")),
+        "visibility": describe_visibility(m.get("visib")),
+        "visibility_sm": visibility,
+        "weather": weather,
+        "clouds": describe_clouds(layers),
+        "cloud_layers": layers,
+        "ceiling_ft": ceiling,
+        "temperature": None if temp is None else f"{temp:g}°C ({round(temp * 9 / 5 + 32)}°F)",
+        "dewpoint": None if dew is None else f"{dew:g}°C ({round(dew * 9 / 5 + 32)}°F)",
+        "hazards": hazards,
+        "checks": drone_checks(m.get("wspd"), m.get("wgst"), visibility, layers, weather,
+                               hazards, max_wind, altitude_ft),
+        "raw": raw,
+    }
+
+
+def decode_taf(t: dict, max_wind: float, altitude_ft: int, tz=None) -> dict:
+    """
+    A TAF from AWC as a timeline of periods.
+
+    FM starts a new prevailing period; TEMPO, PROB and BECMG overlay the one
+    in force, so they are labelled rather than treated as replacements.
+    """
+    periods = []
+    for f in t.get("fcsts") or []:
+        layers = cloud_layers(f.get("clouds"), vertical_visibility=f.get("vertVis"))
+        visibility = _number(f.get("visib"))
+        weather = describe_weather(f.get("wxString"))
+        change = f.get("fcstChange")
+        label = None
+        if change == "PROB" or f.get("probability"):
+            label = f"{f.get('probability') or '?'}% chance"
+            if change == "TEMPO":
+                label += ", temporarily"
+        elif change in ("TEMPO", "BECMG"):
+            label = TAF_CHANGES[change]
+        ceiling = ceiling_ft(layers)
+        has_wind = _number(f.get("wspd")) is not None
+        periods.append({
+            "from": local_span(f.get("timeFrom"), f.get("timeTo"), tz),
+            "from_utc": datetime.fromtimestamp(f["timeFrom"], tz=timezone.utc).isoformat()
+                        if f.get("timeFrom") else None,
+            "to_utc": datetime.fromtimestamp(f["timeTo"], tz=timezone.utc).isoformat()
+                      if f.get("timeTo") else None,
+            "change": label,
+            "wind": describe_wind(f.get("wdir"), f.get("wspd"), f.get("wgst")) if has_wind else None,
+            "wind_dir": f.get("wdir"),
+            "wind_kt": _number(f.get("wspd")),
+            "gust_kt": _number(f.get("wgst")),
+            "visibility": describe_visibility(f.get("visib")) if visibility is not None else None,
+            "visibility_sm": visibility,
+            "weather": weather,
+            "clouds": describe_clouds(layers) if layers else None,
+            "cloud_layers": layers,
+            "ceiling_ft": ceiling,
+            "category": flight_category(ceiling, visibility),
+            # Overlay periods only list what changes, so only judge what they say
+            "checks": [c for c in drone_checks(f.get("wspd"), f.get("wgst"), visibility, layers,
+                                               weather, [], max_wind, altitude_ft)
+                       if label is None or "not reported" not in c[1]],
+        })
+    return {
+        "station": t.get("icaoId"),
+        "name": t.get("name"),
+        "issued": local_time(_epoch(t.get("issueTime")), tz),
+        "valid": local_span(t.get("validTimeFrom"), t.get("validTimeTo"), tz),
+        "periods": periods,
+        "raw": t.get("rawTAF"),
+    }
+
+
+def _epoch(iso: Optional[str]) -> Optional[float]:
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+# ============================================================================
 # Map
 # ============================================================================
 
@@ -1638,6 +2125,92 @@ def print_nearby(location: dict, summary: dict, radius_nm: float) -> None:
     print()
 
 
+CHECK_MARKS = {"ok": "\u2713", "warn": "\u26a0", "fail": "\u2717"}
+
+
+def _station_line(station: dict, location: Optional[dict]) -> str:
+    line = f"{station.get('name') or '?'} ({station.get('id') or station.get('station')})"
+    if location and station.get("distance_nm") is not None:
+        line += f" \u00b7 {station['distance_nm']:g} NM {station['direction']} of {location['query']}"
+    return line
+
+
+def _print_checks(checks: list, indent: str = "    ") -> None:
+    for status, text in checks:
+        print(f"{indent}{CHECK_MARKS[status]} {text}")
+
+
+def print_metar(report: dict, station: dict, location: Optional[dict], args) -> None:
+    print(f"\n  {_station_line({**station, 'name': report['name'] or station.get('name')}, location)}")
+    age = report["age_minutes"]
+    stale = "  \u26a0 over 90 minutes old" if age is not None and age > 90 else ""
+    print(f"  Observed {report['observed']} \u00b7 {age} min ago{stale}")
+    print("  " + "=" * 58)
+    category = report["category"]
+    print(f"  Category:    {category} ({FLIGHT_CATEGORIES.get(category, '?')})" if category
+          else "  Category:    not reported")
+    print(f"  Wind:        {report['wind']}")
+    print(f"  Visibility:  {report['visibility']}")
+    if report["weather"]:
+        print(f"  Weather:     {', '.join(report['weather'])}")
+    print(_wrap(f"Clouds:      {report['clouds']}", "  ").replace("\n  ", "\n               "))
+    print(f"  Ceiling:     {report['ceiling_ft']:,} ft" if report["ceiling_ft"] is not None
+          else "  Ceiling:     none")
+    if report["temperature"]:
+        print(f"  Temp/dew:    {report['temperature']} / {report['dewpoint']}")
+    if report["hazards"]:
+        print(f"  Hazards:     {'; '.join(report['hazards'])}")
+    print(f"\n  Drone check ({args.altitude} ft AGL, {args.max_wind:g} kt wind limit)")
+    _print_checks(report["checks"])
+    print(_wrap(f"Raw: {report['raw']}", "  ").replace("\n  ", "\n       "))
+    print()
+
+
+def _compact_period(p: dict) -> str:
+    parts = []
+    if p["category"]:
+        parts.append(f"{p['category']:<4}")
+    if p["wind_kt"] is not None:
+        gust = f" G{int(p['gust_kt'])}" if p["gust_kt"] else ""
+        heading = ("VRB" if p["wind_dir"] in (None, "", "VRB")
+                   else bearing_to_cardinal(int(_number(p["wind_dir"]) or 0)))
+        parts.append("calm" if not p["wind_kt"] else f"{heading} {int(p['wind_kt'])}{gust} kt")
+    if p["visibility"]:
+        parts.append(p["visibility"].replace(" statute miles", " SM").replace(" statute mile", " SM"))
+    if p["weather"]:
+        parts.append(", ".join(p["weather"]))
+    if p["clouds"]:
+        parts.append(p["clouds"])
+    return " \u00b7 ".join(parts)
+
+
+def print_taf(report: dict, station: dict, location: Optional[dict], args) -> None:
+    print(f"\n  TAF {_station_line({**station, 'name': report['name'] or station.get('name')}, location)}")
+    print(f"  Issued {report['issued']} \u00b7 valid {report['valid']}")
+    print("  " + "=" * 58)
+    for p in report["periods"]:
+        when = p["from"] if not p["change"] else f"  \u21b3 {p['change']}"
+        print(f"  {when:<22} {_compact_period(p)}")
+        problems = [c for c in p["checks"] if c[0] != "ok"]
+        if problems:
+            _print_checks(problems, indent=" " * 25)
+    print(f"\n  Drone limits: {args.altitude} ft AGL, {args.max_wind:g} kt wind; "
+          "\u2717 and \u26a0 mark periods that break or need watching")
+    print(_wrap(f"Raw: {report['raw']}", "  ").replace("\n  ", "\n       "))
+    print()
+
+
+def print_stations(stations: list, location: dict, radius_nm: float) -> None:
+    print(f"\n  Weather stations within {radius_nm:g} NM of {location['query']}")
+    print("  " + "=" * 58)
+    for s in stations:
+        kinds = "METAR + TAF" if s["has_taf"] else "METAR"
+        print(f"  {s['id']:<6} {(s['name'] or '?')[:34]:<34} {s['distance_nm']:>5.1f} NM {s['direction']:<3}  {kinds}")
+    if not stations:
+        print("  None - try a larger --radius")
+    print()
+
+
 # ============================================================================
 # Command handlers
 # ============================================================================
@@ -1707,6 +2280,116 @@ def cmd_map(args: argparse.Namespace) -> int:
                          args.port, not args.no_open)
     except FAAError as e:
         return _fail(str(e))
+
+
+# A station identifier, or a comma separated list of them (KFLL, KFLL,KMIA)
+STATION_IDS = re.compile(r"^[A-Za-z][A-Za-z0-9]{3}(,[A-Za-z][A-Za-z0-9]{3})*$")
+
+
+def _weather_reports(args, kind: str) -> list:
+    """
+    (station, location, report) for each requested station.
+
+    Station IDs are tried first; a place name that happens to look like one
+    (Rome, Iowa) falls back to geocoding when AWC knows no such station.
+    """
+    client = WeatherClient()
+    fetch = client.metars if kind == "metar" else client.tafs
+    query = args.location.strip()
+    if STATION_IDS.match(query):
+        wanted = query.upper().split(",")
+        found = sorted(fetch(wanted), key=lambda r: wanted.index(r.get("icaoId"))
+                       if r.get("icaoId") in wanted else len(wanted))
+        if found:
+            return [({"id": r.get("icaoId"), "name": r.get("name")}, None, r) for r in found]
+
+    location = _locate(args, lookup_address=False)
+    lat, lng = location["latitude"], location["longitude"]
+    candidates = client.candidates(lat, lng, need_taf=(kind == "taf"))
+    if not candidates:
+        raise FAAError(f"No {kind.upper()} station within {STATION_SEARCH_NM[-1]:g} NM of {query}")
+    # Part-time TAFs and offline sensors: nearest station that actually reported
+    reports = {r.get("icaoId"): r for r in fetch([c["id"] for c in candidates])}
+    station = next((c for c in candidates if c["id"] in reports), None)
+    if not station:
+        raise FAAError(f"None of the nearest {kind.upper()} stations "
+                       f"({', '.join(c['id'] for c in candidates)}) has a current report")
+    skipped = [c["id"] for c in candidates[:candidates.index(station)]]
+    if skipped:
+        print(f"Note: {', '.join(skipped)} has no current {kind.upper()}; using {station['id']}",
+              file=sys.stderr)
+    found = [reports[station["id"]]]
+    if kind == "taf" and station["distance_nm"] > TAF_COVERAGE_NM:
+        print(f"Warning: nearest TAF airport {station['id']} is {station['distance_nm']:g} NM away; "
+              "a TAF covers 5 SM around its airport, so treat it as regional",
+              file=sys.stderr)
+    return [(station, location, found[0])]
+
+
+def cmd_metar(args: argparse.Namespace) -> int:
+    try:
+        _check_limits(args)
+        results = []
+        for station, location, record in _weather_reports(args, "metar"):
+            report = decode_metar(record, args.max_wind, args.altitude)
+            results.append((station, location, report))
+        if args.json:
+            out = [{"location": loc, "station": st, "metar": rep} for st, loc, rep in results]
+            print(json.dumps(out if len(out) > 1 else out[0], indent=2))
+        elif args.raw:
+            for _, _, report in results:
+                print(report["raw"])
+        else:
+            for station, location, report in results:
+                print_metar(report, station, location, args)
+        return 0
+    except FAAError as e:
+        return _fail(str(e))
+
+
+def cmd_taf(args: argparse.Namespace) -> int:
+    try:
+        _check_limits(args)
+        results = []
+        for station, location, record in _weather_reports(args, "taf"):
+            results.append((station, location, decode_taf(record, args.max_wind, args.altitude)))
+        if args.json:
+            out = [{"location": loc, "station": st, "taf": rep} for st, loc, rep in results]
+            print(json.dumps(out if len(out) > 1 else out[0], indent=2))
+        elif args.raw:
+            for _, _, report in results:
+                print(report["raw"])
+        else:
+            for station, location, report in results:
+                print_taf(report, station, location, args)
+        return 0
+    except FAAError as e:
+        return _fail(str(e))
+
+
+def cmd_stations(args: argparse.Namespace) -> int:
+    try:
+        _check_radius(args.radius)
+        location = _locate(args, lookup_address=False)
+        stations = WeatherClient().stations(location["latitude"], location["longitude"], args.radius)
+        if args.taf_only:
+            stations = [s for s in stations if s["has_taf"]]
+        if args.json:
+            print(json.dumps({"location": location, "radius_nm": args.radius,
+                              "stations": stations}, indent=2))
+        else:
+            print_stations(stations, location, args.radius)
+        return 0
+    except FAAError as e:
+        return _fail(str(e))
+
+
+def _check_limits(args: argparse.Namespace) -> None:
+    if not math.isfinite(args.max_wind) or args.max_wind <= 0:
+        raise FAAError("--max-wind must be a positive number of knots")
+    if args.altitude <= 0:
+        raise FAAError("--altitude must be a positive number of feet")
+
 
 
 def _value_option_strings(parser: argparse.ArgumentParser) -> set:
@@ -1858,6 +2541,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="Screenshot size for --png (default: {}x{})".format(*DEFAULT_PNG_SIZE)
     )
 
+    for name, kind, about in [
+        ("metar", "METAR", "Current conditions decoded, with drone checks"),
+        ("taf", "TAF", "Forecast timeline decoded, with drone checks"),
+    ]:
+        weather_parser = subparsers.add_parser(
+            name, help=about,
+            description=f"{about}. LOCATION is a station ID (KFLL, or KFLL,KMIA) or any "
+                        f"place, which uses the nearest {kind}-reporting station."
+        )
+        _add_location_options(weather_parser)
+        weather_parser.add_argument(
+            "--max-wind",
+            type=float,
+            default=float(os.environ.get("FAA_MAX_WIND", DEFAULT_MAX_WIND_KT)),
+            metavar="KT",
+            help=f"Your aircraft's wind limit in knots (default: {DEFAULT_MAX_WIND_KT:g}, "
+                 "or FAA_MAX_WIND)"
+        )
+        weather_parser.add_argument(
+            "--altitude",
+            type=int,
+            default=400,
+            metavar="FT",
+            help="Planned height in ft AGL for the cloud clearance check (default: 400)"
+        )
+        weather_parser.add_argument("--raw", action="store_true", help="Print only the raw report")
+        weather_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+
+    stations_parser = subparsers.add_parser(
+        "stations",
+        help="Weather reporting stations near a point",
+        description="METAR stations within a radius, marking which also issue TAFs."
+    )
+    _add_location_options(stations_parser)
+    stations_parser.add_argument(
+        "--radius", "-r",
+        type=float,
+        default=DEFAULT_STATION_RADIUS_NM,
+        help=f"Search radius in nautical miles, up to 50 (default: {DEFAULT_STATION_RADIUS_NM:g})"
+    )
+    stations_parser.add_argument("--taf-only", action="store_true",
+                                 help="Only stations that issue TAFs")
+    stations_parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+
     return parser
 
 
@@ -1871,6 +2598,9 @@ def main(argv: Optional[list] = None) -> int:
         "airspace": cmd_airspace,
         "nearby": cmd_nearby,
         "map": cmd_map,
+        "metar": cmd_metar,
+        "taf": cmd_taf,
+        "stations": cmd_stations,
     }
     handler = commands.get(args.command)
     if handler:
