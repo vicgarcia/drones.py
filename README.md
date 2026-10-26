@@ -1,0 +1,206 @@
+# faa.py
+
+A Python CLI for drone pilots: FAA airspace and aviation weather for any place in the US, with a single go/no-go preflight.
+
+## Features
+
+- **Single-file executable** - Uses `uv run --script` with inline dependencies (PEP 723)
+- **Preflight** - Airspace plus the weather for when you plan to fly, as one GO / CAUTION / NO-GO verdict
+- **Airspace** - Controlled airspace, LAANC ceilings, special use and security airspace, TFRs and stadiums at a point or within a radius
+- **METAR and TAF, decoded** - Current conditions and forecasts in plain language, with Part 107 and wind-limit checks
+- **Nearest station logic** - Current conditions from the closest METAR station, forecasts from the closest airport that issues TAFs
+- **Interactive map** - The airspace around a point on a local Leaflet map, as GeoJSON, or as a PNG
+- **No API keys** - FAA UAS Data Delivery System, tfr.faa.gov, NOAA Aviation Weather Center, OpenStreetMap
+
+## Prerequisites
+
+- Python 3.10+
+- [uv](https://github.com/astral-sh/uv) package manager
+
+## Installation
+
+```bash
+# Clone and make executable
+git clone https://github.com/vicgarcia/faa.py.git
+cd faa.py
+chmod +x faa.py
+
+# Run (dependencies install on first run)
+./faa.py --help
+
+# Install
+cp faa.py ~/.local/bin
+chmod +x ~/.local/bin/faa.py
+```
+
+## Configuration
+
+```bash
+# Your aircraft's wind limit in knots (default 20); --max-wind overrides it
+export FAA_MAX_WIND=18
+
+# Browser for map --png, when Chrome/Edge/Chromium is not found automatically
+export FAA_BROWSER="/path/to/chrome"
+```
+
+## Commands
+
+| Command | What it answers |
+|---------|-----------------|
+| `preflight` | Can I fly here at this time? Airspace plus weather as one verdict |
+| `airspace` | What airspace and restrictions apply at this point? |
+| `nearby` | What airports, airspace and restrictions are within a radius? |
+| `metar` | What are conditions right now? |
+| `taf` | What is the forecast? |
+| `stations` | Which weather stations report near here? |
+| `map` | Show me the airspace on a map |
+
+Every command takes a place name, an address, or `lat,lng` coordinates. `metar` and `taf`
+also take station IDs (`KFLL`, or `KFLL,KMIA`).
+
+## Usage
+
+### Preflight
+
+```bash
+faa.py preflight "Hollywood, FL"
+faa.py preflight "Hollywood Beach, FL" --at "tomorrow 7am" --max-wind 15
+faa.py preflight 41.79,-87.74 --at 2pm --altitude 200 --json
+```
+
+```
+  Preflight: Young Circle, Hollywood, FL
+  ==========================================================
+  When:       Sun 9:32 PM (400 ft AGL, 20 kt wind limit)
+  Verdict:    CAUTION
+              - gusts 19 kt near your 20 kt limit
+              - cumulonimbus nearby
+              Requires: LAANC available: near-instant approval up to 400 ft
+              AGL through an FAA-approved LAANC app (Aloft, Autel, DJI
+              FlightHub, etc.).
+
+  Airspace
+    AUTHORIZATION REQUIRED: Class C FORT LAUDERDALE CLASS C
+    LAANC ceiling 400 ft AGL
+
+  Weather
+    Ft Lauderdale-Hollywood Intl (KFLL) · 4.2 NM NNW of Young Circle, Hollywood, FL
+    Observed 8:53 PM EDT (00:53Z): VFR, wind ENE 60° at 10 kt (12 mph),
+    gusting 19 kt (22 mph), visibility 10+ statute miles, clouds scattered
+    2,600 ft (cumulonimbus)
+      ⚠ gusts 19 kt near your 20 kt limit
+      ✓ visibility meets 3 SM
+      ✓ clouds clear of 400 ft + 500 ft
+      ⚠ cumulonimbus nearby
+```
+
+Within the hour the nearest METAR decides; later times use the TAF period in force plus any
+TEMPO/PROB overlays, whose failures only raise CAUTION. A TFR, prohibited area or national
+defense airspace is NO-GO regardless of weather. Exits 3 on NO-GO.
+
+### Airspace
+
+```bash
+faa.py airspace "Chicago Midway Airport"
+faa.py airspace 41.79,-87.74 --json
+faa.py airspace "Montrose Beach" --near "Chicago, IL" --within 15
+faa.py nearby "Navy Pier, Chicago"
+faa.py nearby 38.8895,-77.0353 --radius 5
+```
+
+### Weather
+
+```bash
+faa.py metar "Hollywood, FL"
+faa.py metar KFLL,KMIA --max-wind 15
+faa.py taf "Hollywood, FL"
+faa.py taf KMIA --raw
+faa.py stations "Hollywood, FL" --taf-only
+```
+
+```
+  TAF Ft Lauderdale-Hollywood Intl (KFLL) · 4.2 NM NNW of Young Circle, Hollywood, FL
+  Issued 7:20 PM EDT (23:20Z) · valid Sun 8 PM - Tue 2 AM
+  ==========================================================
+  Sun 8 PM - Mon 12 AM   VFR  · NE 15 G25 kt · 6+ SM · showers in the vicinity · scattered 2,000 ft, broken 6,000 ft
+                         ✗ gusts 25 kt over your 20 kt limit
+  Mon 12 AM - Mon 12 PM  VFR  · NE 12 G22 kt · 6+ SM · showers in the vicinity · scattered 2,000 ft, scattered 6,000 ft
+                         ✗ gusts 22 kt over your 20 kt limit
+```
+
+METAR and TAF pick their stations independently: the nearest METAR station for conditions
+(about 2,900 in the US), the nearest TAF airport for forecasts (about 860), skipping
+part-time TAF airports that have no current forecast. A TAF covers 5 SM around its airport,
+so one more than 10 NM away comes with a warning.
+
+Decoding goes beyond AWC's JSON where it falls short: cumulonimbus and towering cumulus are
+recovered from the raw report (the JSON drops the `CB` tag), remark hazards such as
+`CB ALQDS MOV SW` and lightning are spelled out, and TAF periods get a computed flight
+category.
+
+**Drone checks:** wind and gusts against `--max-wind` (warning within 85% of it), Part 107's
+3 SM visibility, and 500 ft below clouds at your `--altitude` (default 400 ft AGL), plus
+thunderstorms, cumulonimbus, precipitation and fog.
+
+### Map
+
+```bash
+faa.py map "Chicago Midway Airport"
+faa.py map 41.79,-87.74 --radius 5 --tiles satellite
+faa.py map "Denver, CO" --geojson > denver.geojson
+faa.py map "Navy Pier, Chicago" --radius 2 --png navy-pier.png
+faa.py map 41.79,-87.74 --png midway.png --tiles satellite --size 1920x1080
+```
+
+Serves on `127.0.0.1`, falls back to a free port if 8765 is taken, and runs until Ctrl+C.
+
+## Data Sources
+
+| Data | Source |
+|------|--------|
+| LAANC grid, class airspace, special use, prohibited and defense airspace, national security UAS restrictions, stadiums, recreational sites, airports | FAA UAS Data Delivery System - the public ArcGIS layers behind the FAA UAS Facility Map |
+| TFR shapes and NOTAM links | tfr.faa.gov |
+| METAR, TAF and the station index | NOAA Aviation Weather Center (aviationweather.gov) |
+| Geocoding | OpenStreetMap Nominatim |
+
+All free with no key. Nominatim allows 1 request a second (paced automatically), AWC about 100
+a minute. Not covered: NOTAMs other than TFRs (the FAA NOTAM API needs a key), LAANC filing
+(only approved suppliers can submit), real-time activation of NOTAM-activated airspace (shown
+as CAUTION), and airspace outside the US.
+
+> Advisory only - FAA data is not real time and is not an authorization to fly. Confirm with
+> B4UFLY or a LAANC app and check NOTAMs before you fly.
+
+## Development
+
+Run the offline regression suite (service calls are mocked, network access is refused):
+
+```bash
+uv run --with 'geopy>=2.4.0' --with 'requests>=2.31.0' python -m unittest discover -v
+```
+
+## Agent Skill
+
+This project includes a `SKILL.md` file for use with AI coding agents (Claude Code, etc.). The skill enables natural language airspace checks, aviation weather, and preflight decisions.
+
+### Installation
+
+```bash
+# Create skills directory
+mkdir -p /path/to/agent/skills/faa
+
+# Copy SKILL.md
+cp /path/to/faa.py/SKILL.md /path/to/agent/skills/faa/SKILL.md
+
+# Ensure faa.py is executable and in PATH
+chmod +x ~/.local/bin/faa.py
+```
+
+### Usage with Claude Code
+
+Add the skills directory to your agent configuration, then interact naturally:
+
+> "Can I fly my drone at Hollywood Beach tomorrow morning?"
+> "What's the weather at KFLL right now?"
+> "Is there a TFR near Navy Pier today?"
+> "Show me the airspace around Midway on a map"
