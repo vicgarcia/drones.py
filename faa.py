@@ -18,6 +18,7 @@ layers behind the FAA UAS Facility Map) and tfr.faa.gov. No API key required.
 """
 
 import argparse
+import html
 import http.server
 import json
 import math
@@ -58,6 +59,8 @@ AMBIGUITY_RATIO = 0.85
 FAA_SERVICES = "https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services"
 TFR_SHAPES_URL = "https://tfr.faa.gov/geoserver/TFR/ows"
 TFR_DETAIL_URL = "https://tfr.faa.gov/tfr3/?page=detail_{}"
+# NOTAM text for one TFR: effective times and altitudes, which the shape feed lacks
+TFR_TEXT_URL = "https://tfr.faa.gov/tfrapi/getWebText"
 
 # NOAA Aviation Weather Center data API (METAR, TAF, station index)
 AWC_URL = "https://aviationweather.gov/api/data"
@@ -739,6 +742,106 @@ class FAAClient:
             })
         return shapes
 
+    def tfr_details(self, notam: str) -> dict:
+        """Effective window and altitudes for one TFR, from its NOTAM text."""
+        data = self._get_json(TFR_TEXT_URL, {"notamId": notam})
+        record = data[0] if isinstance(data, list) and data else data
+        if not isinstance(record, dict) or not record.get("text"):
+            raise FAAError(f"No NOTAM text for TFR {notam}")
+        return parse_tfr_text(record["text"])
+
+
+def parse_tfr_text(text: str) -> dict:
+    """
+    Effective window and altitudes from a TFR's NOTAM page.
+
+    The page is HTML; its top-level 'Beginning/Ending Date and Time' span every
+    area ('Effective Immediately' and 'Permanent' mean open-ended), and each
+    area gives an 'Altitude:' line.
+    """
+    lines = [l.strip() for l in html.unescape(re.sub(r"<[^>]+>", "\n", text or "")).splitlines()]
+    lines = [l for l in lines if l]
+
+    def value_after(label):
+        for i, line in enumerate(lines[:-1]):
+            if line.startswith(label):
+                return lines[i + 1]
+        return None
+
+    def moment(value):
+        match = re.search(r"([A-Z][a-z]+ \d{1,2}, \d{4}) at (\d{2})(\d{2}) UTC", value or "")
+        if not match:
+            return None
+        day = datetime.strptime(match.group(1), "%B %d, %Y")
+        return day.replace(hour=int(match.group(2)), minute=int(match.group(3)), tzinfo=timezone.utc)
+
+    begins_text, ends_text = value_after("Beginning Date and Time"), value_after("Ending Date and Time")
+    floors, ceilings = set(), []
+    for i, line in enumerate(lines[:-1]):
+        if line != "Altitude:":
+            continue
+        span = re.sub(r"\s+", " ", lines[i + 1])
+        found = re.search(r"From (the surface|[\d,]+ feet (?:MSL|AGL))\s+up to and including ([\d,]+) feet (MSL|AGL)",
+                          span)
+        if found:
+            floors.add("SFC" if found.group(1) == "the surface"
+                       else f"{int(found.group(1).split()[0].replace(',', '')):,} ft {found.group(1).split()[-1]}")
+            ceilings.append((int(found.group(2).replace(",", "")), found.group(3)))
+    ceiling = max(ceilings) if ceilings else None
+    return {
+        "begins": moment(begins_text),
+        "ends": moment(ends_text),
+        "immediate": "immediately" in (begins_text or "").lower(),
+        "permanent": "permanent" in (ends_text or "").lower(),
+        "floor": "SFC" if "SFC" in floors else (sorted(floors)[0] if floors else None),
+        "ceiling": f"{ceiling[0]:,} ft {ceiling[1]}" if ceiling else None,
+    }
+
+
+def tfr_status(details: Optional[dict], when: datetime) -> str:
+    """active, scheduled or expired at `when`; unknown when the NOTAM text was unavailable."""
+    if not details or (details["begins"] is None and not details["immediate"]):
+        return "unknown"
+    if details["begins"] and when < details["begins"]:
+        return "scheduled"
+    if details["ends"] and when >= details["ends"]:
+        return "expired"
+    return "active"
+
+
+def annotate_tfrs(faa: "FAAClient", features: list, when: Optional[datetime] = None) -> list:
+    """
+    Add status, window and altitudes to TFR shapes, dropping expired ones.
+
+    Only the TFRs that matter here are looked up, a few at a time. A lookup
+    that fails leaves the TFR as 'unknown', which is treated as active.
+    """
+    when = when or datetime.now(timezone.utc)
+    notams = sorted({f["properties"].get("notam") for f in features} - {None})
+
+    def lookup(notam):
+        try:
+            return notam, faa.tfr_details(notam)
+        except FAAError:
+            return notam, None
+
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_QUERIES) as pool:
+        details = dict(pool.map(lookup, notams))
+
+    kept = []
+    for feature in features:
+        props = feature["properties"]
+        found = details.get(props.get("notam"))
+        props["status"] = tfr_status(found, when)
+        if props["status"] == "expired":
+            continue
+        if found:
+            props.update(begins=found["begins"].isoformat() if found["begins"] else None,
+                         ends=found["ends"].isoformat() if found["ends"] else None,
+                         floor=found["floor"], ceiling=found["ceiling"])
+        kept.append(feature)
+    return kept
+
 
 def gather(faa: FAAClient, lat: float, lng: float, requests_by_layer: dict) -> dict:
     """
@@ -982,12 +1085,39 @@ def nsufr_entry(props: dict) -> dict:
     }
 
 
+def _local_moment(iso: Optional[str]) -> Optional[str]:
+    if not iso:
+        return None
+    here = datetime.fromisoformat(iso).astimezone()
+    name = here.tzname() or ""
+    if " " in name:
+        name = "".join(word[0] for word in name.split())
+    return f"{here.strftime('%a %b %d %I:%M %p').replace(' 0', ' ')} {name}".strip()
+
+
+def tfr_window(props: dict) -> str:
+    status = props.get("status")
+    begins, ends = _local_moment(props.get("begins")), _local_moment(props.get("ends"))
+    if status == "scheduled":
+        return f"scheduled {begins}" + (f" to {ends}" if ends else ", then permanent")
+    if status == "active":
+        return f"active until {ends}" if ends else "active, permanent"
+    return "times unavailable - treat as active"
+
+
 def tfr_entry(props: dict) -> dict:
+    status = props.get("status") or "unknown"
     return {
-        "severity": "no-fly",
+        "severity": "caution" if status == "scheduled" else "no-fly",
         "kind": f"TFR ({(props.get('type') or 'unknown').lower()})",
         "name": props.get("title"),
         "notam": props.get("notam"),
+        "status": status,
+        "begins": props.get("begins"),
+        "ends": props.get("ends"),
+        "floor": props.get("floor"),
+        "ceiling": props.get("ceiling"),
+        "hours": tfr_window(props),
         "url": props.get("url"),
     }
 
@@ -1081,9 +1211,12 @@ def assess(controlled: list, laanc: Optional[dict], restrictions: list,
         notes.append("Uncontrolled airspace (Class G) at the surface: no authorization "
                      "needed up to 400 ft AGL.")
 
-    if any(r["severity"] == "caution" for r in restrictions):
+    if any(r["severity"] == "caution" and not r.get("kind", "").startswith("TFR") for r in restrictions):
         notes.append("Special use or security airspace overlaps this point - check "
                      "whether it is active before flying.")
+    if any(r["severity"] == "caution" and r.get("kind", "").startswith("TFR") for r in restrictions):
+        notes.append("A TFR here is scheduled but not active at the time checked - "
+                     "see its dates below.")
     if stadiums:
         notes.append("Within 3 NM of a stadium: flight is prohibited below 3,000 ft AGL "
                      "from 1 hour before to 1 hour after major sporting events.")
@@ -1093,8 +1226,8 @@ def assess(controlled: list, laanc: Optional[dict], restrictions: list,
     return verdict, notes
 
 
-def check_point(faa: FAAClient, lat: float, lng: float) -> dict:
-    """Everything that applies at one point."""
+def check_point(faa: FAAClient, lat: float, lng: float, when: Optional[datetime] = None) -> dict:
+    """Everything that applies at one point, with TFRs judged at `when` (default now)."""
     data = gather(faa, lat, lng, {
         "laanc": {},
         "class": {},
@@ -1116,8 +1249,8 @@ def check_point(faa: FAAClient, lat: float, lng: float) -> dict:
         [sua_entry(f["properties"]) for f in data["prohibited"] + data["sua"]]
         + [defense_entry(f["properties"]) for f in data["defense"]]
         + [nsufr_entry(f["properties"]) for f in data["nsufr"]]
-        + [tfr_entry(f["properties"]) for f in data["tfrs"]
-           if contains(f["geometry"], lat, lng)],
+        + [tfr_entry(f["properties"]) for f in annotate_tfrs(
+            faa, [f for f in data["tfrs"] if contains(f["geometry"], lat, lng)], when)],
         ("kind", "name"),
     )
     stadiums = sorted((stadium_entry(f, lat, lng) for f in data["stadiums"]),
@@ -1138,7 +1271,8 @@ def check_point(faa: FAAClient, lat: float, lng: float) -> dict:
     }
 
 
-def survey(faa: FAAClient, lat: float, lng: float, radius_nm: float) -> dict:
+def survey(faa: FAAClient, lat: float, lng: float, radius_nm: float,
+           when: Optional[datetime] = None) -> dict:
     """
     Every feature within radius_nm, with geometry, keyed by layer.
 
@@ -1154,9 +1288,9 @@ def survey(faa: FAAClient, lat: float, lng: float, radius_nm: float) -> dict:
             d = distance_nm(feature["geometry"], lat, lng)
             feature["properties"]["_distance_nm"] = None if d is None else round(d, 2)
 
-    data["tfrs"] = [f for f in data["tfrs"]
-                    if f["properties"]["_distance_nm"] is not None
-                    and f["properties"]["_distance_nm"] <= radius_nm]
+    data["tfrs"] = annotate_tfrs(faa, [f for f in data["tfrs"]
+                                       if f["properties"]["_distance_nm"] is not None
+                                       and f["properties"]["_distance_nm"] <= radius_nm], when)
     return data
 
 
@@ -1712,7 +1846,7 @@ def preflight(lat: float, lng: float, when: datetime, max_wind: float, altitude_
     if lead > 30:
         raise FAAError("--at is more than 30 hours out, beyond any TAF")
 
-    airspace = check_point(FAAClient(), lat, lng)
+    airspace = check_point(FAAClient(), lat, lng, when)
     client = WeatherClient()
     weather = {"source": None, "station": None, "metar": None, "taf_periods": []}
 
@@ -1744,13 +1878,21 @@ def preflight(lat: float, lng: float, when: datetime, max_wind: float, altitude_
         verdict, reasons = "CAUTION", ["no weather report available for this time and place"]
 
     requirements = []
-    if airspace["verdict"] == "DO NOT FLY":
+    # Name the restrictions themselves: an AUTHORIZATION REQUIRED verdict would
+    # otherwise hide cautions such as a scheduled TFR inside controlled airspace
+    def named(r):
+        text = f"airspace: {r['kind']} - {r['name']}"
+        return text + f" ({r['hours']})" if r["kind"].startswith("TFR") else text
+    no_fly = [named(r) for r in airspace["restrictions"] if r["severity"] == "no-fly"]
+    cautions = [named(r) for r in airspace["restrictions"] if r["severity"] == "caution"]
+    cautions += [f"airspace: within 3 NM of {s['name']} (event TFRs during major games)"
+                 for s in airspace["stadiums"]]
+    if no_fly:
         verdict = "NO-GO"
-        reasons = ["airspace: prohibited area, national defense airspace or TFR"] + reasons
-    elif airspace["verdict"] == "CAUTION" and verdict == "GO":
+        reasons = no_fly + reasons
+    elif cautions and verdict == "GO":
         verdict = "CAUTION"
-    if airspace["verdict"] == "CAUTION":
-        reasons.append("airspace: special use or security airspace, or a stadium nearby")
+    reasons += cautions
     if airspace["verdict"] == "AUTHORIZATION REQUIRED":
         requirements.append(airspace["notes"][0])
         ceiling = (airspace["laanc"] or {}).get("ceiling_ft")
@@ -1856,7 +1998,12 @@ def map_features(location: dict, data: dict, radius_nm: float) -> list:
         key = json.dumps(f["geometry"], sort_keys=True)
         shapes.setdefault(key, (f["geometry"], []))[1].append(tfr_entry(f["properties"]))
     for geometry, entries in shapes.values():
-        props = restriction("tfrs", entries[0], "#d7191c", 0.25)
+        scheduled = all(e["status"] == "scheduled" for e in entries)
+        props = restriction("tfrs", entries[0], "#fd8d3c" if scheduled else "#d7191c",
+                            0.12 if scheduled else 0.25)
+        if scheduled:
+            props["title"] += " (scheduled)"
+            props["stroke-dasharray"] = "6 4"
         if len(entries) > 1:
             props["title"] = f"{entries[0]['kind']} - {len(entries)} NOTAMs on this area"
             for entry in entries:

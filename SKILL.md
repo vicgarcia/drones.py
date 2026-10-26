@@ -23,8 +23,9 @@ faa.py preflight 41.79,-87.74 --at 2pm --altitude 200 --json
   passed today means tomorrow. Up to 30 hours out.
 - Within the hour it uses the nearest **METAR**; later, the **TAF** period in force at that
   time plus any TEMPO/PROB overlays.
-- Verdict is `GO`, `CAUTION` or `NO-GO`, with `reasons`. A TFR, prohibited area or national
-  defense airspace is NO-GO regardless of weather. A weather minimum failed in the
+- Verdict is `GO`, `CAUTION` or `NO-GO`, with `reasons` naming each restriction. An active
+  TFR, prohibited area or national defense airspace is NO-GO regardless of weather; a TFR
+  scheduled for later is CAUTION, with its window in the reason. A weather minimum failed in the
   prevailing forecast is NO-GO; failed only in a TEMPO/PROB overlay it is CAUTION
   ("possible: ...").
 - LAANC appears under `requirements`, not as a verdict - including a warning when the LAANC
@@ -39,7 +40,9 @@ faa.py airspace "Montrose Beach" --near "Chicago, IL" --within 15
 ```
 Verdict `CLEAR`, `CAUTION`, `AUTHORIZATION REQUIRED` or `DO NOT FLY`, with surface airspace
 class, LAANC facility map ceiling and the airports/programs behind it, special use and
-security airspace, TFRs containing the point, and stadiums within 3 NM.
+security airspace, TFRs containing the point, and stadiums within 3 NM. Each TFR shows its
+status from the NOTAM text: active (NO-FLY), scheduled (CAUTION, with start and end times),
+or "times unavailable - treat as active". Expired TFRs still in the FAA feed are dropped.
 
 ### nearby - everything within a radius
 ```bash

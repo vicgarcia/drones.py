@@ -95,8 +95,14 @@ faa.py preflight 41.79,-87.74 --at 2pm --altitude 200 --json
 ```
 
 Within the hour the nearest METAR decides; later times use the TAF period in force plus any
-TEMPO/PROB overlays, whose failures only raise CAUTION. A TFR, prohibited area or national
-defense airspace is NO-GO regardless of weather. Exits 3 on NO-GO.
+TEMPO/PROB overlays, whose failures only raise CAUTION. An active TFR, prohibited area or
+national defense airspace is NO-GO regardless of weather. Exits 3 on NO-GO.
+
+TFRs are judged at the time you ask about. The FAA's shape feed lists scheduled TFRs alongside
+active ones and carries no times or altitudes, so faa.py reads each nearby TFR's NOTAM text:
+active means NO-GO, scheduled means CAUTION with its window (e.g. "scheduled Tue Oct 27
+10:30 AM EDT to 4:00 PM EDT"), expired is dropped, and one whose text can't be fetched is
+treated as active.
 
 ### Airspace
 
@@ -159,7 +165,7 @@ Serves on `127.0.0.1`, falls back to a free port if 8765 is taken, and runs unti
 | Data | Source |
 |------|--------|
 | LAANC grid, class airspace, special use, prohibited and defense airspace, national security UAS restrictions, stadiums, recreational sites, airports | FAA UAS Data Delivery System - the public ArcGIS layers behind the FAA UAS Facility Map |
-| TFR shapes and NOTAM links | tfr.faa.gov |
+| TFR shapes, NOTAM text (effective times, altitudes) and links | tfr.faa.gov |
 | METAR, TAF and the station index | NOAA Aviation Weather Center (aviationweather.gov) |
 | Geocoding | OpenStreetMap Nominatim |
 

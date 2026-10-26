@@ -278,7 +278,17 @@ def fake_gather(results):
     return gather
 
 
+ACTIVE_TFR = {"begins": None, "ends": None, "immediate": True, "permanent": True,
+              "floor": "SFC", "ceiling": "17,999 ft MSL"}
+
+
 class CommandTests(OfflineCase):
+    def setUp(self):
+        super().setUp()
+        details = patch.object(faa.FAAClient, "tfr_details", return_value=ACTIVE_TFR)
+        details.start()
+        self.addCleanup(details.stop)
+
     def run_cli(self, *argv):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), patch.object(faa, "utf8_output"):
@@ -596,10 +606,15 @@ class PreflightTests(OfflineCase):
                 patch.object(faa, "WeatherClient", return_value=client):
             return faa.preflight(26.0, -80.2, at or self.NOW, 20, 400, now=self.NOW)
 
-    def airspace(self, verdict="CLEAR", ceiling=None):
+    def airspace(self, verdict="CLEAR", ceiling=None, restrictions=()):
         return {"verdict": verdict, "notes": ["LAANC available up to 300 ft"],
                 "laanc": {"ceiling_ft": ceiling} if ceiling is not None else None,
-                "airspace": [], "restrictions": []}
+                "airspace": [], "restrictions": list(restrictions), "stadiums": []}
+
+    @staticmethod
+    def tfr(status):
+        return faa.tfr_entry({"type": "VIP", "title": "VIP TFR", "notam": "6/1", "status": status,
+                              "begins": "2026-10-27T14:30:00+00:00", "ends": "2026-10-27T20:00:00+00:00"})
 
     def test_gusts_over_the_limit_are_no_go(self):
         report = self.run_preflight(self.airspace(), KFLL_METAR)
@@ -609,10 +624,20 @@ class PreflightTests(OfflineCase):
 
     def test_tfr_overrides_good_weather_and_laanc_is_a_requirement(self):
         calm = {**KFLL_METAR, "wspd": 5, "wgst": None, "rawOb": "METAR KFLL 252353Z 04005KT 10SM CLR"}
-        self.assertEqual(self.run_preflight(self.airspace("DO NOT FLY"), calm)["verdict"], "NO-GO")
+        report = self.run_preflight(self.airspace("DO NOT FLY", restrictions=[self.tfr("active")]), calm)
+        self.assertEqual(report["verdict"], "NO-GO")
+        self.assertEqual(report["reasons"][0], "airspace: TFR (vip) - VIP TFR (active until "
+                         + faa._local_moment("2026-10-27T20:00:00+00:00") + ")")
         report = self.run_preflight(self.airspace("AUTHORIZATION REQUIRED", ceiling=300), calm)
         self.assertEqual(report["verdict"], "GO")
         self.assertIn("LAANC ceiling 300 ft is below your planned 400 ft", report["requirements"])
+
+    def test_scheduled_tfr_in_controlled_airspace_still_cautions(self):
+        calm = {**KFLL_METAR, "wspd": 5, "wgst": None, "rawOb": "METAR KFLL 252353Z 04005KT 10SM CLR"}
+        report = self.run_preflight(self.airspace("AUTHORIZATION REQUIRED", ceiling=400,
+                                                  restrictions=[self.tfr("scheduled")]), calm)
+        self.assertEqual(report["verdict"], "CAUTION")
+        self.assertTrue(report["reasons"][0].startswith("airspace: TFR (vip) - VIP TFR (scheduled "))
 
     def test_time_window_is_checked(self):
         with self.assertRaisesRegex(faa.FAAError, "30 hours"):
@@ -628,6 +653,59 @@ class PreflightTests(OfflineCase):
             code = faa.main(["preflight", "26.0,-80.2", "--json"])
         self.assertEqual(code, 3)
         self.assertEqual(json.loads(out.getvalue())["verdict"], "NO-GO")
+
+
+NOTAM_TEXT = """<td>Beginning Date and Time     :</td><td>October 27, 2026 at 1430 UTC</td>
+<td>Ending Date and Time     :</td><td>October 27, 2026 at 2000 UTC</td>
+<p>Area A</p><td>Altitude:</td><td>From the surface  up to and including 4999 feet AGL</td>
+<p>Area B</p><td>Altitude:</td><td>From the surface  up to and including 3000 feet AGL</td>"""
+
+
+class TFRTimeTests(OfflineCase):
+    def test_parses_window_and_highest_altitude(self):
+        details = faa.parse_tfr_text(NOTAM_TEXT)
+        self.assertEqual(details["begins"], faa.datetime(2026, 10, 27, 14, 30, tzinfo=faa.timezone.utc))
+        self.assertEqual(details["ends"], faa.datetime(2026, 10, 27, 20, 0, tzinfo=faa.timezone.utc))
+        self.assertEqual((details["floor"], details["ceiling"]), ("SFC", "4,999 ft AGL"))
+
+    def test_permanent_and_immediate(self):
+        details = faa.parse_tfr_text("<td>Beginning Date and Time :</td><td>Effective Immediately</td>"
+                                     "<td>Ending Date and Time :</td><td>Permanent</td>")
+        self.assertTrue(details["immediate"] and details["permanent"])
+        self.assertEqual(faa.tfr_status(details, faa.datetime.now(faa.timezone.utc)), "active")
+
+    def test_status_at_a_time(self):
+        details = faa.parse_tfr_text(NOTAM_TEXT)
+        at = lambda h: faa.datetime(2026, 10, 27, h, 0, tzinfo=faa.timezone.utc)
+        self.assertEqual(faa.tfr_status(details, at(12)), "scheduled")
+        self.assertEqual(faa.tfr_status(details, at(15)), "active")
+        self.assertEqual(faa.tfr_status(details, at(21)), "expired")
+        self.assertEqual(faa.tfr_status(None, at(15)), "unknown")
+
+    def test_scheduled_tfr_is_caution_and_expired_is_dropped(self):
+        client = faa.FAAClient()
+        shapes = [feature({"notam": "6/1", "type": "VIP", "title": "VIP TFR"}, SQUARE),
+                  feature({"notam": "6/2", "type": "HAZARDS", "title": "Old fire"}, SQUARE)]
+        windows = {"6/1": faa.parse_tfr_text(NOTAM_TEXT),
+                   "6/2": {**faa.parse_tfr_text(NOTAM_TEXT),
+                           "begins": faa.datetime(2026, 10, 25, tzinfo=faa.timezone.utc),
+                           "ends": faa.datetime(2026, 10, 26, tzinfo=faa.timezone.utc)}}
+        with patch.object(client, "tfr_details", side_effect=windows.get):
+            kept = faa.annotate_tfrs(client, shapes, faa.datetime(2026, 10, 27, 12, tzinfo=faa.timezone.utc))
+        self.assertEqual([f["properties"]["notam"] for f in kept], ["6/1"])
+        entry = faa.tfr_entry(kept[0]["properties"])
+        self.assertEqual((entry["status"], entry["severity"]), ("scheduled", "caution"))
+        self.assertTrue(entry["hours"].startswith("scheduled "))
+        verdict, notes = faa.assess([], None, [entry], [], [])
+        self.assertEqual(verdict, "CAUTION")
+        self.assertIn("scheduled but not active", " ".join(notes))
+
+    def test_failed_lookup_stays_no_fly(self):
+        client = faa.FAAClient()
+        with patch.object(client, "tfr_details", side_effect=faa.FAAError("down")):
+            kept = faa.annotate_tfrs(client, [feature({"notam": "6/1", "type": "SECURITY"}, SQUARE)])
+        entry = faa.tfr_entry(kept[0]["properties"])
+        self.assertEqual((entry["status"], entry["severity"]), ("unknown", "no-fly"))
 
 
 if __name__ == "__main__":
