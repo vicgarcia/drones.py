@@ -177,6 +177,9 @@ as CAUTION), and airspace outside the US.
 > Advisory only - FAA data is not real time and is not an authorization to fly. Confirm with
 > B4UFLY or a LAANC app and check NOTAMs before you fly.
 
+[WIKI.md](WIKI.md) has the reference details: every FAA layer and field, how TFR times are read,
+the AWC endpoints and JSON quirks, how stations are chosen, and Part 107 weather rules.
+
 ## Development
 
 Run the offline regression suite (service calls are mocked, network access is refused):
