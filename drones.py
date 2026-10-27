@@ -32,6 +32,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import urllib.parse
 import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -74,6 +75,22 @@ DEFAULT_MAX_WIND_KT = 20.0
 # Wind at this share of the limit or more is flagged as close
 WIND_MARGIN = 0.85
 
+# Live air traffic for the map (--adsb): adsb.fi's open data API, which allows
+# one request a second and a radius of up to 250 NM, and asks for attribution
+ADSBFI_URL = "https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{dist}"
+ADSBFI_ATTRIBUTION = 'Traffic &copy; <a href="https://adsb.fi">adsb.fi</a>'
+MAX_TRAFFIC_NM = 250
+TRAFFIC_MIN_INTERVAL = 1.1
+# Positions older than this are dropped rather than drawn where the aircraft was
+TRAFFIC_STALE_SECONDS = 60
+EMERGENCY_SQUAWKS = {"7500", "7600", "7700"}
+
+# Weather radar for the map (--radar): NOAA's MRMS quality-controlled base
+# reflectivity mosaic for the lower 48, a WMS updated every two minutes
+RADAR_WMS_URL = "https://opengeo.ncep.noaa.gov/geoserver/conus/conus_bref_qcd/ows"
+RADAR_LAYER = "conus_bref_qcd"
+RADAR_ATTRIBUTION = 'Radar &copy; <a href="https://www.nssl.noaa.gov/projects/mrms/">NOAA MRMS</a>'
+
 # Seconds to wait between retries when a service throttles us
 RETRY_DELAYS = (2, 5, 10)
 
@@ -107,6 +124,7 @@ Examples:
   drones.py map "Denver, CO" --geojson > denver.geojson
   drones.py map "Navy Pier, Chicago" --radius 2 --png navy-pier.png
   drones.py map 41.79,-87.74 --png midway.png --tiles satellite --size 1920x1080
+  drones.py map "Chicago Midway Airport" --adsb --radar
 
   drones.py metar "Hollywood, FL"
   drones.py metar KFLL,KMIA --max-wind 15
@@ -246,6 +264,14 @@ CEILING_COLORS = [
     (200, "#fee08b"), (300, "#a6d96a"), (400, "#1a9850"),
 ]
 
+# Aircraft barometric altitude bands, ft MSL, low (red, where drones fly) to high
+ALTITUDE_COLORS = [
+    (0, "#d7301f"), (1500, "#f46d43"), (3000, "#fdae61"),
+    (6000, "#74add1"), (10000, "#4575b4"),
+]
+# Airborne but not reporting an altitude
+NO_ALTITUDE_COLOR = "#9e9e9e"
+
 # Sectional chart convention: B solid blue, C solid magenta, D dashed blue,
 # Class E surface areas dashed magenta
 CLASS_STYLES = {
@@ -308,6 +334,18 @@ MAP_PAGE = """\
     font: 600 11px system-ui, sans-serif; color: #222;
     text-shadow: 0 0 2px #fff, 0 0 2px #fff, 0 0 2px #fff;
   }
+  /* aircraft: icon rotated to the track, label to its right */
+  .ac svg { display: block; overflow: visible; }
+  .ac span {
+    position: absolute; left: 27px; top: 50%; transform: translateY(-50%);
+    white-space: nowrap; padding: 1px 5px 1px 4px;
+    background: rgba(255, 255, 255, .92); color: #111;
+    border-left: 3px solid; border-radius: 3px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, .3);
+    font: 400 11px/1.25 system-ui, sans-serif; font-variant-numeric: tabular-nums;
+  }
+  .ac span b { font-weight: 650; }
+  .ac.emergency svg { filter: drop-shadow(0 0 3px #e7298a) drop-shadow(0 0 3px #e7298a); }
 __SCREENSHOT_CSS__
 </style>
 </head>
@@ -322,8 +360,14 @@ const BASEMAPS = __BASEMAPS__;
 const DEFAULT_BASEMAP = __DEFAULT_BASEMAP__;
 const PASSIVE = __PASSIVE__;
 const FIXED = __FIXED__;
+// Live layers turned on with --adsb and --radar, null when off
+const TRAFFIC = __TRAFFIC__;
+const RADAR = __RADAR__;
 // LAANC ceiling labels only once the grid cells are big enough to read
 const LABEL_ZOOM = 14;
+const TRAFFIC_REFRESH_MS = 3 * 1000;
+const RADAR_REFRESH_MS = 2 * 60 * 1000;
+const METERS_PER_NM = 1852;
 
 // Fractional zoom lets fitBounds fill the view with the radius ring instead
 // of snapping out to the next whole level, which can leave half the frame empty
@@ -429,6 +473,113 @@ function toggleCeilings() {
   }
 }
 map.on('moveend', toggleCeilings);
+
+// Weather radar: NOAA's WMS, between the basemap and the airspace. Basemaps sit
+// at z-index 1; without the zIndex, switching basemap would cover the radar.
+if (RADAR) {
+  const radar = L.tileLayer.wms(RADAR.url, {
+    layers: RADAR.layer, format: 'image/png', transparent: true, opacity: 0.6,
+    zIndex: 10, attribution: RADAR.attribution
+  }).addTo(map);
+  control.addOverlay(radar, 'Weather radar');
+  let latest = null;
+  // Pin the newest frame, so a long-open map moves forward with the radar
+  // rather than showing whatever frame the browser cached first
+  const refreshRadar = () => fetch('radar.json')
+    .then(r => r.ok ? r.json() : null)
+    .then(info => {
+      if (info && info.latest && info.latest !== latest) {
+        latest = info.latest;
+        radar.setParams({ time: latest });
+      }
+    })
+    .catch(() => {});
+  refreshRadar();
+  setInterval(refreshRadar, RADAR_REFRESH_MS);
+}
+
+// Air traffic: one marker per aircraft, moved in place on every poll
+const PLANE = 'M12 2c.8 0 1.3.9 1.3 2v5l7.7 4.5v2l-7.7-2.4v4.6l2.2 1.7v1.6L12 20l-3.5 1v-1.6l2.2-1.7v-4.6L3 15.5v-2L10.7 9V4c0-1.1.5-2 1.3-2z';
+
+function aircraftIcon(p) {
+  const shape = p.rotorcraft
+    ? '<circle cx="12" cy="12" r="4.5"/><path d="M3 3l18 18M21 3L3 21" stroke-width="2.2" stroke="' + p.color + '"/>'
+    : '<path d="' + PLANE + '"/>';
+  const rotate = p.track !== undefined ? ' style="transform:rotate(' + p.track + 'deg)"' : '';
+  const alt = p.alt_ft !== undefined ? p.alt_ft.toLocaleString() : '';
+  return L.divIcon({
+    className: 'ac' + (p.emergency ? ' emergency' : ''), iconSize: [24, 24],
+    html: '<svg viewBox="0 0 24 24" width="24" height="24"' + rotate + '>' +
+      '<g fill="' + p.color + '" stroke="#fff" stroke-width="1">' + shape + '</g></svg>' +
+      '<span style="border-left-color:' + p.color + '"><b>' + esc(p.label) + '</b>' +
+      (alt ? '<br>' + esc(alt) + ' ft' : '') + '</span>'
+  });
+}
+
+// Radius (NM) of a circle around the view's center that covers the whole view
+function viewRadiusNM() {
+  const center = map.getCenter();
+  const bounds = map.getBounds();
+  return Math.max(map.distance(center, bounds.getNorthEast()),
+                  map.distance(center, bounds.getSouthWest())) / METERS_PER_NM;
+}
+
+if (TRAFFIC) {
+  // Above the airspace and its markers, and display only: clicks pass through
+  map.createPane('traffic').style.zIndex = 650;
+  map.getPane('traffic').style.pointerEvents = 'none';
+  const traffic = L.layerGroup([], { attribution: TRAFFIC.attribution }).addTo(map);
+  control.addOverlay(traffic, 'Air traffic');
+  const markers = new Map();
+  let polling = false;
+
+  const clear = () => { traffic.clearLayers(); markers.clear(); };
+  map.on('overlayremove', e => { if (e.layer === traffic) clear(); });
+
+  async function poll() {
+    if (polling || !map.hasLayer(traffic) || document.hidden) return;
+    const radius = viewRadiusNM();
+    if (radius > TRAFFIC.max_dist_nm) { clear(); return; }
+    const center = map.getCenter().wrap();
+    polling = true;
+    const data = await fetch('traffic.json?lat=' + center.lat.toFixed(4) +
+      '&lng=' + center.lng.toFixed(4) + '&dist=' + Math.max(1, radius).toFixed(1))
+      .then(r => r.ok ? r.json() : null)
+      .catch(() => null);
+    polling = false;
+    if (!data || !map.hasLayer(traffic)) return;
+
+    const current = new Set();
+    for (const f of data.features) {
+      const p = f.properties;
+      const latlng = [f.geometry.coordinates[1], f.geometry.coordinates[0]];
+      current.add(f.id);
+      let marker = markers.get(f.id);
+      if (marker) {
+        marker.setLatLng(latlng).setIcon(aircraftIcon(p));
+      } else {
+        marker = L.marker(latlng, {
+          icon: aircraftIcon(p), pane: 'traffic', interactive: false, keyboard: false
+        });
+        markers.set(f.id, marker);
+        traffic.addLayer(marker);
+      }
+    }
+    for (const [id, marker] of markers) {
+      if (!current.has(id)) {
+        traffic.removeLayer(marker);
+        markers.delete(id);
+      }
+    }
+  }
+  // The view is only set once data.json lands
+  map.whenReady(() => {
+    map.on('moveend overlayadd', poll);
+    setInterval(poll, TRAFFIC_REFRESH_MS);
+    document.addEventListener('visibilitychange', poll);
+    poll();
+  });
+}
 
 fetch('data.json')
   .then(r => r.json())
@@ -1935,6 +2086,132 @@ def _epoch(iso: Optional[str]) -> Optional[float]:
 
 
 # ============================================================================
+# Live traffic and radar (adsb.fi, NOAA MRMS)
+# ============================================================================
+
+def altitude_color(alt_ft) -> str:
+    if alt_ft is None:
+        return NO_ALTITUDE_COLOR
+    color = ALTITUDE_COLORS[0][1]
+    for threshold, candidate in ALTITUDE_COLORS:
+        if alt_ft >= threshold:
+            color = candidate
+    return color
+
+
+def aircraft_feature(a: dict) -> Optional[dict]:
+    """
+    One adsb.fi aircraft record -> a map feature, or None when it is on the
+    ground or has no fresh position.
+
+    Carries only what the map draws: the label, the altitude under it, and what
+    picks the icon, its rotation and colour. The id (the ICAO hex) is how the
+    map moves a marker from one poll to the next rather than redrawing it.
+    """
+    if a.get("lat") is None or a.get("lon") is None:
+        return None
+    if (a.get("seen_pos") or 0) > TRAFFIC_STALE_SECONDS:
+        return None
+
+    if a.get("alt_baro") == "ground":
+        return None
+
+    alt = a.get("alt_baro")
+    track = next((a[k] for k in ("track", "true_heading", "nav_heading") if a.get(k) is not None),
+                 None)
+    properties = {
+        "label": (a.get("flight") or "").strip() or a.get("r") or a.get("hex", "").upper(),
+        "alt_ft": alt,
+        "track": track,
+        "rotorcraft": a.get("category") == "A7",
+        "emergency": a.get("squawk") in EMERGENCY_SQUAWKS
+                     or a.get("emergency") not in (None, "none"),
+        "color": altitude_color(alt),
+    }
+    return {
+        "type": "Feature",
+        "id": a.get("hex"),
+        "geometry": {"type": "Point", "coordinates": [a["lon"], a["lat"]]},
+        "properties": {k: v for k, v in properties.items() if v is not None},
+    }
+
+
+class TrafficClient:
+    """
+    Aircraft near a point from adsb.fi, at most one request a second.
+
+    Coverage comes from volunteer ground receivers, so aircraft low and far
+    from a feeder can be missing, and aircraft without ADS-B never show. This
+    is situational awareness, not see-and-avoid.
+    """
+
+    def __init__(self, timeout: float = 10):
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def nearby(self, lat: float, lng: float, dist_nm: float) -> dict:
+        """Aircraft within dist_nm of a point, as a GeoJSON FeatureCollection."""
+        dist = max(1, min(MAX_TRAFFIC_NM, math.ceil(dist_nm)))
+        url = ADSBFI_URL.format(lat=round(lat, 4), lon=round(lng, 4), dist=dist)
+        # One request at a time however many tabs are polling
+        with self._lock:
+            wait = self._last + TRAFFIC_MIN_INTERVAL - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                response = self.session.get(url, timeout=self.timeout)
+            except requests.RequestException as e:
+                raise DronesError(f"adsb.fi request failed: {e}") from e
+            finally:
+                self._last = time.monotonic()
+
+        if response.status_code == 429:
+            raise DronesError("adsb.fi is rate limiting requests")
+        if response.status_code != 200:
+            raise DronesError(f"adsb.fi returned HTTP {response.status_code}")
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise DronesError("adsb.fi did not return JSON") from e
+        aircraft = data.get("ac") or data.get("aircraft") or []
+        return {"type": "FeatureCollection",
+                "features": [f for f in map(aircraft_feature, aircraft) if f]}
+
+
+TIME_DIMENSION = re.compile(r'<Dimension[^>]*name="time"[^>]*>([^<]*)</Dimension>')
+
+
+def radar_times(capabilities: str) -> list:
+    """The ISO 8601 frame times listed in a WMS GetCapabilities document, oldest first."""
+    match = TIME_DIMENSION.search(capabilities)
+    if not match:
+        return []
+    return sorted(t.strip() for t in match.group(1).split(",") if t.strip())
+
+
+def radar_latest(timeout: float = 30) -> dict:
+    """
+    The newest MRMS radar frame's time.
+
+    The browser fetches the radar images straight from NOAA; this only tells
+    it which frame to ask for, so a long-open map moves forward with the radar.
+    """
+    try:
+        response = requests.get(RADAR_WMS_URL, timeout=timeout,
+                                headers={"User-Agent": USER_AGENT},
+                                params={"service": "WMS", "version": "1.3.0",
+                                        "request": "GetCapabilities"})
+        response.raise_for_status()
+    except requests.RequestException as e:
+        raise DronesError(f"NOAA radar is unavailable: {e}") from e
+    times = radar_times(response.text)
+    return {"latest": times[-1] if times else None}
+
+
+# ============================================================================
 # Map
 # ============================================================================
 
@@ -2065,7 +2342,8 @@ def map_features(location: dict, data: dict, radius_nm: float) -> list:
     return features
 
 
-def map_page(location: dict, tiles: str, size: Optional[tuple[int, int]] = None) -> str:
+def map_page(location: dict, tiles: str, size: Optional[tuple[int, int]] = None,
+             adsb: bool = False, radar: bool = False) -> str:
     """
     Fill the Leaflet page template.
 
@@ -2073,7 +2351,19 @@ def map_page(location: dict, tiles: str, size: Optional[tuple[int, int]] = None)
     screenshot. Headless Chromium lays the page out in a viewport smaller than
     --window-size and only grows it at capture time, too late for the tiles
     the resize uncovers; a fixed-size map loads every tile up front.
+
+    adsb and radar add the live layers, which the page polls from the local
+    server's traffic.json and radar.json.
     """
+    traffic_config = {
+        "attribution": ADSBFI_ATTRIBUTION,
+        "max_dist_nm": MAX_TRAFFIC_NM,
+    } if adsb else None
+    radar_config = {
+        "url": RADAR_WMS_URL,
+        "layer": RADAR_LAYER,
+        "attribution": RADAR_ATTRIBUTION,
+    } if radar else None
     screenshot_css = ""
     if size:
         width, height = size
@@ -2089,7 +2379,9 @@ def map_page(location: dict, tiles: str, size: Optional[tuple[int, int]] = None)
             .replace("__BASEMAPS__", json.dumps(TILE_LAYERS))
             .replace("__DEFAULT_BASEMAP__", json.dumps(tiles))
             .replace("__PASSIVE__", json.dumps(PASSIVE_OVERLAYS))
-            .replace("__FIXED__", json.dumps(FIXED_OVERLAYS)))
+            .replace("__FIXED__", json.dumps(FIXED_OVERLAYS))
+            .replace("__TRAFFIC__", json.dumps(traffic_config))
+            .replace("__RADAR__", json.dumps(radar_config)))
 
 
 def _html_escape(text: str) -> str:
@@ -2114,20 +2406,66 @@ class _MapServer(http.server.ThreadingHTTPServer):
         super().server_bind()
 
 
-def _map_server(page: str, data: dict, port: int) -> http.server.ThreadingHTTPServer:
-    """Bind a localhost server for the Leaflet page and its data."""
+def _traffic_route(client: TrafficClient):
+    """traffic.json?lat=&lng=&dist= for the page's air traffic poll."""
+    def route(query: dict) -> dict:
+        try:
+            lat, lng, dist = (float(query[k][0]) for k in ("lat", "lng", "dist"))
+        except (KeyError, ValueError):
+            raise ValueError("traffic.json needs numeric lat, lng and dist")
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180 and 0 < dist <= MAX_TRAFFIC_NM):
+            raise ValueError("traffic.json lat, lng or dist out of range")
+        return client.nearby(lat, lng, dist)
+    return route
+
+
+def live_routes(adsb: bool, radar: bool) -> dict:
+    """The map server's live data endpoints for --adsb and --radar."""
+    routes = {}
+    if adsb:
+        routes["/traffic.json"] = _traffic_route(TrafficClient())
+    if radar:
+        routes["/radar.json"] = lambda query: radar_latest()
+    return routes
+
+
+def _map_server(page: str, data: dict, port: int,
+                live: Optional[dict] = None) -> http.server.ThreadingHTTPServer:
+    """
+    Bind a localhost server for the Leaflet page and its data.
+
+    live maps further paths to functions of the parsed query string that
+    fetch fresh JSON on every request.
+    """
     routes = {
         "/": ("text/html; charset=utf-8", page.encode()),
         "/data.json": ("application/json", json.dumps(data).encode()),
     }
+    live = live or {}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            path = self.path.split("?")[0]
+            path, _, query = self.path.partition("?")
+            if path in live:
+                self._live(live[path], query)
+                return
             if path not in routes:
                 self.send_error(404)
                 return
-            content_type, body = routes[path]
+            self._send(*routes[path])
+
+        def _live(self, route, query: str):
+            try:
+                body = json.dumps(route(urllib.parse.parse_qs(query))).encode()
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except DronesError as e:
+                self.send_error(502, str(e))
+                return
+            self._send("application/json", body)
+
+        def _send(self, content_type: str, body: bytes):
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -2147,9 +2485,10 @@ def _map_server(page: str, data: dict, port: int) -> http.server.ThreadingHTTPSe
         return _MapServer(("127.0.0.1", 0), Handler)
 
 
-def serve_map(page: str, data: dict, port: int, open_browser: bool) -> int:
+def serve_map(page: str, data: dict, port: int, open_browser: bool,
+              live: Optional[dict] = None) -> int:
     """Serve the Leaflet page on localhost until interrupted."""
-    server = _map_server(page, data, port)
+    server = _map_server(page, data, port, live)
     url = f"http://127.0.0.1:{server.server_address[1]}/"
     feature_count = len(data.get("features") or [])
     print(f"\n  Serving map at {url}")
@@ -2208,7 +2547,7 @@ def find_browser() -> Optional[str]:
 
 
 def screenshot_map(page: str, data: dict, path: str, size: tuple[int, int],
-                   wait_ms: int = SCREENSHOT_WAIT_MS) -> str:
+                   wait_ms: int = SCREENSHOT_WAIT_MS, live: Optional[dict] = None) -> str:
     """
     Render the map to a PNG with a headless Chromium browser.
 
@@ -2225,7 +2564,7 @@ def screenshot_map(page: str, data: dict, path: str, size: tuple[int, int],
     if os.path.exists(output):
         os.remove(output)  # so a stale file can't pass for a fresh capture
 
-    server = _map_server(page, data, 0)
+    server = _map_server(page, data, 0, live)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_address[1]}/"
 
@@ -2584,13 +2923,15 @@ def cmd_map(args: argparse.Namespace) -> int:
         if args.geojson:
             print(json.dumps(collection, indent=2))
             return 0
+        live = live_routes(args.adsb, args.radar)
         if args.png:
-            page = map_page(location, args.tiles, size=args.size)
-            saved = screenshot_map(page, collection, args.png, args.size)
+            page = map_page(location, args.tiles, size=args.size,
+                            adsb=args.adsb, radar=args.radar)
+            saved = screenshot_map(page, collection, args.png, args.size, live=live)
             print(f"\n  Saved map to {saved}\n")
             return 0
-        return serve_map(map_page(location, args.tiles), collection,
-                         args.port, not args.no_open)
+        return serve_map(map_page(location, args.tiles, adsb=args.adsb, radar=args.radar),
+                         collection, args.port, not args.no_open, live=live)
     except DronesError as e:
         return _fail(str(e))
 
@@ -2856,6 +3197,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="street",
         choices=list(TILE_LAYERS),
         help="Starting basemap; all are switchable on the map (default: street)"
+    )
+    map_parser.add_argument(
+        "--adsb",
+        action="store_true",
+        help="Show live air traffic from adsb.fi, refreshed every 3 seconds"
+    )
+    map_parser.add_argument(
+        "--radar",
+        action="store_true",
+        help="Show NOAA MRMS weather radar (lower 48), refreshed every 2 minutes"
     )
     map_parser.add_argument(
         "--port", "-p",

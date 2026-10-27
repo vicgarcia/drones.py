@@ -492,6 +492,73 @@ class WeatherDecodeTests(OfflineCase):
         self.assertIn(("fail", "visibility 0.75 SM below the 3 SM minimum"), tempo["checks"])
 
 
+class LiveLayerTests(OfflineCase):
+    def test_aircraft_feature_carries_only_what_the_map_draws(self):
+        f = drones.aircraft_feature({"hex": "a1b2c3", "flight": "SWA123  ", "lat": 41.8,
+                                     "lon": -87.7, "alt_baro": 2400, "track": 310,
+                                     "category": "A3", "seen_pos": 1.2, "squawk": "1200"})
+        self.assertEqual(f["id"], "a1b2c3")
+        self.assertEqual(f["geometry"]["coordinates"], [-87.7, 41.8])
+        self.assertEqual(f["properties"], {"label": "SWA123", "alt_ft": 2400,
+                                           "track": 310, "rotorcraft": False, "emergency": False,
+                                           "color": "#f46d43"})
+
+    def test_ground_emergency_and_stale_aircraft(self):
+        self.assertIsNone(drones.aircraft_feature({"hex": "abc", "lat": 41, "lon": -87,
+                                                   "alt_baro": "ground"}))
+        emergency = drones.aircraft_feature({"hex": "abc", "r": "N12345", "lat": 41, "lon": -87,
+                                             "squawk": "7700"})
+        self.assertNotIn("alt_ft", emergency["properties"])
+        self.assertEqual(emergency["properties"]["label"], "N12345")
+        self.assertEqual(emergency["properties"]["color"], drones.NO_ALTITUDE_COLOR)
+        self.assertTrue(emergency["properties"]["emergency"])
+        self.assertIsNone(drones.aircraft_feature({"hex": "abc", "lat": 41, "lon": -87,
+                                                   "seen_pos": 120}))
+        self.assertIsNone(drones.aircraft_feature({"hex": "abc"}))
+
+    def test_traffic_client_caps_the_radius_and_reports_throttling(self):
+        client = drones.TrafficClient()
+        client.session = Mock()
+        client.session.get.return_value = Mock(status_code=200, json=lambda: {"ac": [
+            {"hex": "a", "lat": 41, "lon": -87, "alt_baro": 900}, {"hex": "b"}]})
+        with patch.object(drones.time, "sleep"):
+            data = client.nearby(41.123456, -87.654321, 400)
+            self.assertEqual([f["id"] for f in data["features"]], ["a"])
+            self.assertTrue(client.session.get.call_args.args[0]
+                            .endswith("/lat/41.1235/lon/-87.6543/dist/250"))
+            client.session.get.return_value = Mock(status_code=429)
+            with self.assertRaisesRegex(drones.DronesError, "rate limiting"):
+                client.nearby(41, -87, 5)
+
+    def test_traffic_route_validates_the_query(self):
+        client = Mock()
+        route = drones._traffic_route(client)
+        route({"lat": ["41.8"], "lng": ["-87.7"], "dist": ["12.5"]})
+        client.nearby.assert_called_once_with(41.8, -87.7, 12.5)
+        for bad in ({"lat": ["x"], "lng": ["0"], "dist": ["1"]}, {"lat": ["41"], "lng": ["-87"]},
+                    {"lat": ["41"], "lng": ["-87"], "dist": ["900"]}):
+            with self.assertRaises(ValueError):
+                route(bad)
+
+    def test_radar_times_from_capabilities(self):
+        doc = ('<Layer><Dimension name="time" units="ISO8601">2026-10-26T12:02:00Z,'
+               '2026-10-26T12:00:00Z, 2026-10-26T12:04:00Z</Dimension></Layer>')
+        self.assertEqual(drones.radar_times(doc)[-1], "2026-10-26T12:04:00Z")
+        self.assertEqual(drones.radar_times("<Layer/>"), [])
+
+    def test_map_page_carries_live_layers_only_when_asked(self):
+        location = {"query": "Midway", "latitude": 41.79, "longitude": -87.74}
+        plain = drones.map_page(location, "street")
+        self.assertIn("const TRAFFIC = null;", plain)
+        self.assertIn("const RADAR = null;", plain)
+        live = drones.map_page(location, "street", adsb=True, radar=True)
+        self.assertIn(drones.RADAR_LAYER, live)
+        self.assertIn('"max_dist_nm": 250', live)
+        self.assertNotIn("__", live.split("<script>")[1].split("const LABEL_ZOOM")[0])
+        self.assertEqual(set(drones.live_routes(True, True)), {"/traffic.json", "/radar.json"})
+        self.assertEqual(drones.live_routes(False, False), {})
+
+
 class WeatherClientTests(OfflineCase):
     def setUp(self):
         super().setUp()

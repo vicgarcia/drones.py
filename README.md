@@ -156,7 +156,14 @@ drones.py map 41.79,-87.74 --radius 5 --tiles satellite
 drones.py map "Denver, CO" --geojson > denver.geojson
 drones.py map "Navy Pier, Chicago" --radius 2 --png navy-pier.png
 drones.py map 41.79,-87.74 --png midway.png --tiles satellite --size 1920x1080
+drones.py map "Chicago Midway Airport" --adsb --radar
 ```
+
+`--adsb` adds live air traffic from [adsb.fi](https://adsb.fi), polled every 3 seconds and coloured by
+altitude. Coverage comes from volunteer ground receivers, so low traffic far from a feeder and
+aircraft without ADS-B are missing: situational awareness, not see-and-avoid. `--radar` adds
+NOAA's MRMS base reflectivity mosaic (lower 48), refreshed every 2 minutes. Both are toggles on
+the map, and neither affects `--geojson`.
 
 Serves on `127.0.0.1`, falls back to a free port if 8765 is taken, and runs until Ctrl+C.
 
@@ -167,6 +174,8 @@ Serves on `127.0.0.1`, falls back to a free port if 8765 is taken, and runs unti
 | LAANC grid, class airspace, special use, prohibited and defense airspace, national security UAS restrictions, stadiums, airports | FAA UAS Data Delivery System - the public ArcGIS layers behind the FAA UAS Facility Map |
 | TFR shapes, NOTAM text (effective times, altitudes) and links | tfr.faa.gov |
 | METAR, TAF and the station index | NOAA Aviation Weather Center (aviationweather.gov) |
+| Live air traffic (`map --adsb`) | adsb.fi open data API |
+| Weather radar (`map --radar`) | NOAA MRMS base reflectivity WMS |
 | Geocoding | OpenStreetMap Nominatim |
 
 All free with no key. Nominatim allows 1 request a second (paced automatically), AWC about 100
