@@ -357,7 +357,7 @@ function styleFor(feature) {
   const p = feature.properties || {};
   const geometry = feature.geometry || {};
   if (geometry.type && geometry.type.indexOf('Point') !== -1 && p['marker-color']) {
-    return { color: '#fff', weight: 2, fillColor: p['marker-color'], fillOpacity: 1 };
+    return pointStyle(p);
   }
   return {
     color: p['stroke'] || '#3388ff',
@@ -369,14 +369,26 @@ function styleFor(feature) {
   };
 }
 
+// A filled dot with a white ring, unless the feature styles its own outline
+function pointStyle(p) {
+  return {
+    color: p['stroke'] || '#fff',
+    weight: p['stroke-width'] !== undefined ? p['stroke-width'] : 2,
+    dashArray: p['stroke-dasharray'] || null,
+    fillColor: p['marker-color'],
+    fillOpacity: p['fill-opacity'] !== undefined ? p['fill-opacity'] : 1
+  };
+}
+
 function markerFor(feature, latlng) {
   const p = feature.properties || {};
-  const sizes = { small: 5, medium: 7, large: 10 };
+  // simplestyle's sizes, plus a tiny one for the search center
+  const sizes = { tiny: 3, small: 5, medium: 7, large: 10 };
   if (!p['marker-color']) return L.marker(latlng);
-  return L.circleMarker(latlng, {
-    radius: sizes[p['marker-size']] || 7,
-    color: '#fff', weight: 2, fillColor: p['marker-color'], fillOpacity: 1
-  });
+  // A number is a radius in pixels, for sizes between the named ones
+  const size = p['marker-size'];
+  const radius = typeof size === 'number' ? size : sizes[size] || 7;
+  return L.circleMarker(latlng, { radius, ...pointStyle(p) });
 }
 
 const HIDDEN_KEYS = /^(stroke|fill|marker-|_)/;
@@ -2033,21 +2045,22 @@ def map_features(location: dict, data: dict, radius_nm: float) -> list:
             "description": f"{'Public' if entry['public'] else 'Private'} {entry['type']}",
             "Elevation": f"{entry['elevation_ft']} ft MSL" if entry["elevation_ft"] is not None else None,
             "Distance": f"{entry['distance_nm']} NM {entry['direction']}",
-            "marker-color": "#252525" if entry["public"] else "#969696",
-            "marker-size": "medium" if entry["public"] else "small",
+            "marker-color": "#2166ac" if entry["public"] else "#6baed6",
+            "marker-size": 8.5 if entry["public"] else 6,
+            "stroke-width": 0,
         }))
 
     features.append(_feature(
         {"type": "Polygon", "coordinates": [circle_ring(lat, lng, radius_nm)]},
         {"_layer": "radius", "title": f"{radius_nm:g} NM radius",
-         "stroke": "#333333", "stroke-width": 2, "stroke-dasharray": "6 6",
+         "stroke": "#737373", "stroke-width": 1.5, "stroke-dasharray": "6 6",
          "fill-opacity": 0}))
     features.append(_feature(
         {"type": "Point", "coordinates": [lng, lat]},
         {"_layer": "location", "title": location["query"],
          "description": location.get("address"),
          "Coordinates": f"{lat:.5f}, {lng:.5f}",
-         "marker-color": "#e6550d", "marker-size": "large"}))
+         "marker-color": "#737373", "marker-size": "tiny", "stroke-width": 0}))
 
     return features
 
