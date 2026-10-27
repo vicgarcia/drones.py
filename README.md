@@ -1,16 +1,20 @@
 # drones.py
 
-A Python CLI for drone pilots: FAA airspace and aviation weather for any place in the US, with a single go/no-go preflight.
+A Python CLI for drone pilots: FAA airspace for any place in the US, on the command line or an
+interactive map, with aviation weather, a go/no-go preflight and live air traffic when you want them.
+
+![Airspace and air traffic around 4406 Fillmore St, Hollywood, FL](screenshot.png)
 
 ## Features
 
 - **Single-file executable** - Uses `uv run --script` with inline dependencies (PEP 723)
+- **Airspace** - Controlled airspace, LAANC ceilings, special use and security airspace, TFRs and stadiums at a point or within a radius, plus TFRs close by
+- **Interactive map** - The airspace around a point on a local Leaflet map, with optional live air traffic and weather radar; or as GeoJSON or a PNG
 - **Preflight** - Airspace plus the weather for when you plan to fly, as one GO / CAUTION / NO-GO verdict
-- **Airspace** - Controlled airspace, LAANC ceilings, special use and security airspace, TFRs and stadiums at a point or within a radius
 - **METAR and TAF, decoded** - Current conditions and forecasts in plain language, with Part 107 and wind-limit checks
 - **Nearest station logic** - Current conditions from the closest METAR station, forecasts from the closest airport that issues TAFs
-- **Interactive map** - The airspace around a point on a local Leaflet map, as GeoJSON, or as a PNG
-- **No API keys** - FAA UAS Data Delivery System, tfr.faa.gov, NOAA Aviation Weather Center, OpenStreetMap
+- **Agent skill** - `SKILL.md` lets coding agents answer "can I fly here?" and drone rules questions
+- **No API keys** - FAA UAS Data Delivery System, tfr.faa.gov, NOAA Aviation Weather Center, adsb.fi, OpenStreetMap
 
 ## Prerequisites
 
@@ -47,18 +51,57 @@ export DRONES_BROWSER="/path/to/chrome"
 
 | Command | What it answers |
 |---------|-----------------|
-| `preflight` | Can I fly here at this time? Airspace plus weather as one verdict |
 | `airspace` | What airspace and restrictions apply at this point? |
 | `nearby` | What airports, airspace and restrictions are within a radius? |
+| `map` | Show me the airspace on a map |
+| `preflight` | Can I fly here at this time? Airspace plus weather as one verdict |
 | `metar` | What are conditions right now? |
 | `taf` | What is the forecast? |
 | `stations` | Which weather stations report near here? |
-| `map` | Show me the airspace on a map |
 
 Every command takes a place name, an address, or `lat,lng` coordinates. `metar` and `taf`
 also take station IDs (`KFLL`, or `KFLL,KMIA`).
 
 ## Usage
+
+### Airspace
+
+```bash
+drones.py airspace "4406 Fillmore St, Hollywood, FL"
+drones.py airspace 41.79,-87.74 --json
+drones.py airspace "Montrose Beach" --near "Chicago, IL" --within 15
+drones.py nearby "Navy Pier, Chicago"
+drones.py nearby 38.8895,-77.0353 --radius 2
+```
+
+```
+  Airspace check: 4406 Fillmore St, Hollywood, FL
+  ==========================================================
+  Verdict:    AUTHORIZATION REQUIRED
+              LAANC available: near-instant approval up to 300 ft AGL through
+              an FAA-approved LAANC app (Aloft, Autel, DJI FlightHub, etc.).
+
+  Airspace at the surface
+    Class D            HOLLYWOOD CLASS D  (SFC to 2,500 ft MSL)
+                       part time: Legal description references NOTAM
+    Overhead:          Class B MIAMI CLASS B from 3,000 ft MSL
+
+  LAANC facility map (effective 10/1/2026)
+    Ceiling:    300 ft AGL
+    Airport:    KHWO North Perry
+
+  Restrictions
+    None - including 84 published TFRs checked
+
+  TFRs within 10 NM (not over this point)
+    6.4 NM NE  TFR (uas public gathering): Fort Lauderdale, FL, Wednesday, October 28, 2026 ...
+              unknown | SFC to 400 ft AGL | times unavailable - treat as active
+```
+
+`airspace` judges one point: surface class, the LAANC facility map ceiling and the airports
+behind it, special use and security airspace, TFRs over the point, and stadiums within 3 NM.
+TFRs within 10 NM that miss the point are listed apart and don't change the verdict. `nearby`
+lists everything within `--radius` NM (default 5, max 30), with TFRs always out to 30 NM.
 
 ### Preflight
 
@@ -104,16 +147,6 @@ active means NO-GO, scheduled means CAUTION with its window (e.g. "scheduled Tue
 10:30 AM EDT to 4:00 PM EDT"), expired is dropped, and one whose text can't be fetched is
 treated as active.
 
-### Airspace
-
-```bash
-drones.py airspace "Chicago Midway Airport"
-drones.py airspace 41.79,-87.74 --json
-drones.py airspace "Montrose Beach" --near "Chicago, IL" --within 15
-drones.py nearby "Navy Pier, Chicago"
-drones.py nearby 38.8895,-77.0353 --radius 5
-```
-
 ### Weather
 
 ```bash
@@ -151,20 +184,24 @@ thunderstorms, cumulonimbus, precipitation and fog.
 ### Map
 
 ```bash
-drones.py map "Chicago Midway Airport"
-drones.py map 41.79,-87.74 --radius 5 --tiles satellite
+drones.py map "4406 Fillmore St, Hollywood, FL"
+drones.py map 41.79,-87.74 --radius 2 --tiles satellite
 drones.py map "Denver, CO" --geojson > denver.geojson
 drones.py map "Navy Pier, Chicago" --radius 2 --png navy-pier.png
 drones.py map 41.79,-87.74 --png midway.png --tiles satellite --size 1920x1080
 drones.py map "Chicago Midway Airport" --adsb --radar
 ```
 
-The map shows airspace only unless you opt in to live traffic or radar. The
-search radius is 5 NM by default (up to 30) for both `map` and `nearby`. TFRs are always
-included out to 30 NM, whatever the radius.
+The map shows airspace only unless you opt in to live traffic or radar: the LAANC grid colored
+by ceiling (red at 0 ft to green at 400 ft, with the number on each cell once zoomed in), class
+airspace in sectional chart style, special use, prohibited, defense and security areas, TFRs,
+stadiums and airports. Every layer is a toggle, and clicking a feature shows its details. The
+search center and radius ring are always drawn. Basemaps are `street` (default), `satellite`,
+`light` and `dark`, all switchable on the map. The search radius is 5 NM by default (up to 30) for
+both `map` and `nearby`. TFRs are always included out to 30 NM, whatever the radius.
 
 `--adsb` adds live air traffic from [adsb.fi](https://adsb.fi), polled every 3 seconds and coloured by
-altitude. Coverage comes from volunteer ground receivers, so low traffic far from a feeder and
+altitude; aircraft on the ground are left off. Coverage comes from volunteer ground receivers, so low traffic far from a feeder and
 aircraft without ADS-B are missing: situational awareness, not see-and-avoid. `--radar` adds
 NOAA's MRMS base reflectivity mosaic (lower 48), refreshed every 2 minutes. Both are toggles on
 the map, and neither affects `--geojson`.
@@ -190,8 +227,10 @@ as CAUTION), and airspace outside the US.
 > Advisory only - FAA data is not real time and is not an authorization to fly. Confirm with
 > B4UFLY or a LAANC app and check NOTAMs before you fly.
 
-[WIKI.md](WIKI.md) has the reference details: every FAA layer and field, how TFR times are read,
-the AWC endpoints and JSON quirks, how stations are chosen, and Part 107 weather rules.
+[WIKI.md](WIKI.md) is the development reference: every FAA layer and field, how TFR times are read,
+the AWC endpoints and JSON quirks, how stations are chosen, the live traffic and radar feeds, Part 107
+weather rules, how the skill's drone rules material was sourced and is kept current, and the
+reasoning behind the skill and map defaults.
 
 ## Development
 
@@ -203,7 +242,12 @@ uv run --with 'geopy>=2.4.0' --with 'requests>=2.31.0' python -m unittest discov
 
 ## Agent Skill
 
-This project includes a `SKILL.md` file for use with AI coding agents (Claude Code, etc.). The skill enables natural language airspace checks, aviation weather, and preflight decisions.
+This project includes a `SKILL.md` file for use with AI coding agents (Claude Code, etc.). The skill
+answers "can I fly here?" with a short verdict card, sizes up mission areas, and opens the map when
+asked. It treats airspace as the default question: weather, live traffic and radar only come in when
+you ask for them. It also acts as a UAS pilot expert, answering Part 107 and recreational rules
+questions from the regulations in effect, with links to the eCFR sections and FAA pages behind
+each rule.
 
 ### Installation
 
@@ -222,7 +266,10 @@ chmod +x ~/.local/bin/drones.py
 
 Add the skills directory to your agent configuration, then interact naturally:
 
-> "Can I fly my drone at Hollywood Beach tomorrow morning?"
+> "Can I fly my drone at 4406 Fillmore St in Hollywood?"
+> "Can I fly at Hollywood Beach tomorrow morning, and what's the wind doing?"
 > "What's the weather at KFLL right now?"
 > "Is there a TFR near Navy Pier today?"
 > "Show me the airspace around Midway on a map"
+> "Show me a live view with air traffic around FLL"
+> "Can I fly at night under Part 107, and what lights do I need?"
