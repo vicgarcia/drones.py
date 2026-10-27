@@ -266,7 +266,7 @@ MAP_OVERLAYS = [
     ("nsufr", "National security UAS restrictions"),
     ("defense", "National defense airspace"),
     ("class", "Class airspace"),
-    ("stadiums", "Stadiums (3 NM)"),
+    ("stadiums", "Stadiums"),
     ("laanc", "LAANC grid"),
     ("prohibited", "Prohibited areas"),
     ("tfrs", "TFRs"),
@@ -274,8 +274,18 @@ MAP_OVERLAYS = [
     ("location", "Location"),
 ]
 
+# The layer panel lists overlays in draw order, except these, which move up
+# to sit just above the overlay named alongside
+PANEL_MOVES = [("tfrs", "class"), ("laanc", "stadiums")]
+
 # Overlays drawn for reference only, never intercepting clicks
 PASSIVE_OVERLAYS = ["radius"]
+
+# Overlays listed in the layer panel even when none are in range
+ALWAYS_LISTED = ["laanc", "tfrs"]
+
+# Overlays always drawn, left out of the layer control
+FIXED_OVERLAYS = ["radius", "location"]
 
 MAP_PAGE = """\
 <!doctype html>
@@ -290,6 +300,7 @@ MAP_PAGE = """\
 <style>
   html, body, #map { height: 100%; margin: 0; }
   .leaflet-popup-content { font: 13px/1.45 system-ui, sans-serif; }
+  .leaflet-control-layers { text-transform: lowercase; }
   .leaflet-popup-content dt { font-weight: 600; margin-top: 4px; }
   .leaflet-popup-content dd { margin: 0; }
   .ceiling {
@@ -305,9 +316,12 @@ __SCREENSHOT_CSS__
 <script>
 const CENTER = __CENTER__;
 const OVERLAYS = __OVERLAYS__;
+const PANEL_MOVES = __PANEL_MOVES__;
+const ALWAYS_LISTED = __ALWAYS_LISTED__;
 const BASEMAPS = __BASEMAPS__;
 const DEFAULT_BASEMAP = __DEFAULT_BASEMAP__;
 const PASSIVE = __PASSIVE__;
+const FIXED = __FIXED__;
 // LAANC ceiling labels only once the grid cells are big enough to read
 const LABEL_ZOOM = 14;
 
@@ -409,17 +423,22 @@ fetch('data.json')
   .then(data => {
     for (const [key, label] of OVERLAYS) {
       const features = data.features.filter(f => (f.properties || {})._layer === key);
-      if (!features.length) continue;
+      if (!features.length && !ALWAYS_LISTED.includes(key)) continue;
       const passive = PASSIVE.includes(key);
       layers[key] = L.geoJSON({ type: 'FeatureCollection', features }, {
         style: styleFor, pointToLayer: markerFor,
         onEachFeature: passive ? null : popupFor, interactive: !passive
       }).addTo(map);
-      // Merged TFR shapes count once per NOTAM they carry
-      const total = features.reduce((n, f) => n + ((f.properties._links || []).length || 1), 0);
-      const count = (key === 'radius' || key === 'location') ? '' : ' (' + total + ')';
-      control.addOverlay(layers[key], esc(label) + count);
     }
+    const panel = OVERLAYS.filter(([key]) => layers[key] && !FIXED.includes(key));
+    for (const [key, before] of PANEL_MOVES) {
+      const from = panel.findIndex(([k]) => k === key);
+      if (from === -1) continue;
+      const [entry] = panel.splice(from, 1);
+      const to = panel.findIndex(([k]) => k === before);
+      panel.splice(to === -1 ? from : to, 0, entry);
+    }
+    for (const [key, label] of panel) control.addOverlay(layers[key], esc(label));
     const bounds = layers.radius && layers.radius.getBounds();
     if (bounds && bounds.isValid()) {
       map.fitBounds(bounds, { padding: [20, 20] });
@@ -2052,9 +2071,12 @@ def map_page(location: dict, tiles: str, size: Optional[tuple[int, int]] = None)
             .replace("__TITLE__", _html_escape(location["query"]))
             .replace("__CENTER__", json.dumps([location["latitude"], location["longitude"]]))
             .replace("__OVERLAYS__", json.dumps(MAP_OVERLAYS))
+            .replace("__PANEL_MOVES__", json.dumps(PANEL_MOVES))
+            .replace("__ALWAYS_LISTED__", json.dumps(ALWAYS_LISTED))
             .replace("__BASEMAPS__", json.dumps(TILE_LAYERS))
             .replace("__DEFAULT_BASEMAP__", json.dumps(tiles))
-            .replace("__PASSIVE__", json.dumps(PASSIVE_OVERLAYS)))
+            .replace("__PASSIVE__", json.dumps(PASSIVE_OVERLAYS))
+            .replace("__FIXED__", json.dumps(FIXED_OVERLAYS)))
 
 
 def _html_escape(text: str) -> str:
