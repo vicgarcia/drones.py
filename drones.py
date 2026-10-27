@@ -292,11 +292,10 @@ MAP_PAGE = """\
   .leaflet-popup-content dt { font-weight: 600; margin-top: 4px; }
   .leaflet-popup-content dd { margin: 0; }
   .ceiling {
-    display: none; background: none; border: none; box-shadow: none; padding: 0;
+    background: none; border: none; box-shadow: none; padding: 0;
     font: 600 11px system-ui, sans-serif; color: #222;
     text-shadow: 0 0 2px #fff, 0 0 2px #fff, 0 0 2px #fff;
   }
-  .show-ceilings .ceiling { display: block; }
 __SCREENSHOT_CSS__
 </style>
 </head>
@@ -378,17 +377,26 @@ function popupFor(feature, layer) {
     parts.push('<a href="' + esc(url) + '" target="_blank">' + esc(label) + '</a>');
   }
   if (parts.length) layer.bindPopup(parts.join('<br>'));
-  if (p._ceiling !== undefined) {
-    layer.bindTooltip(String(p._ceiling), {
-      permanent: true, direction: 'center', className: 'ceiling'
-    });
-  }
+  if (p._ceiling !== undefined) ceilingCells.push(layer);
 }
 
+// Every label Leaflet holds is repositioned on each zoom step, so only the
+// cells in view carry one, and none below LABEL_ZOOM
+const ceilingCells = [];
 function toggleCeilings() {
-  map.getContainer().classList.toggle('show-ceilings', map.getZoom() >= LABEL_ZOOM);
+  const view = map.getZoom() >= LABEL_ZOOM && map.getBounds().pad(0.2);
+  for (const cell of ceilingCells) {
+    const show = view && view.intersects(cell.getBounds());
+    if (show && !cell.getTooltip()) {
+      cell.bindTooltip(String(cell.feature.properties._ceiling), {
+        permanent: true, direction: 'center', className: 'ceiling'
+      });
+    } else if (!show && cell.getTooltip()) {
+      cell.unbindTooltip();
+    }
+  }
 }
-map.on('zoomend', toggleCeilings);
+map.on('moveend', toggleCeilings);
 
 fetch('data.json')
   .then(r => r.json())
