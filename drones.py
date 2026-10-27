@@ -283,7 +283,7 @@ MAP_PAGE = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>drones.py - __TITLE__</title>
+<title>__TITLE__</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
@@ -314,6 +314,8 @@ const LABEL_ZOOM = 14;
 // Fractional zoom lets fitBounds fill the view with the radius ring instead
 // of snapping out to the next whole level, which can leave half the frame empty
 const map = L.map('map', { preferCanvas: true, zoomSnap: 0.1 });
+// Credit the tile providers only, without Leaflet's own link and flag
+map.attributionControl.setPrefix(false);
 const bases = {};
 for (const [name, tiles] of Object.entries(BASEMAPS)) {
   // Upscale past a provider's last zoom level rather than going blank
