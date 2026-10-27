@@ -127,7 +127,7 @@ Location:
 Data:
   FAA UAS Facility Map (LAANC grid), class airspace, special use airspace,
   prohibited areas, national defense airspace, part-time national security
-  UAS restrictions, stadiums, recreational flyer fixed sites, airports, and
+  UAS restrictions, stadiums, airports, and
   TFR shapes from tfr.faa.gov. Distances are nautical miles (NM).
 
 Weather:
@@ -194,10 +194,6 @@ LAYERS = {
         "fields": ["Facility", "Base", "Reason", "Floor", "Ceiling", "ALERTYPE", "State"],
     },
     "stadiums": {"service": "Stadiums", "fields": ["NAME", "CITY", "STATE", "STATUS_CODE"]},
-    "recreational": {
-        "service": "Recreational_Flyer_Fixed_Sites",
-        "fields": ["SITE_NAME", "CEILING", "UNIT", "CITY", "STATE"],
-    },
     "airports": {
         "service": "US_Airport",
         "where": "OPERSTATUS = 'OPERATIONAL'",
@@ -267,7 +263,6 @@ MAP_OVERLAYS = [
     ("class", "Class airspace"),
     ("stadiums", "Stadiums (3 NM)"),
     ("laanc", "LAANC grid"),
-    ("recreational", "Recreational flyer sites"),
     ("prohibited", "Prohibited areas"),
     ("tfrs", "TFRs"),
     ("airports", "Airports"),
@@ -1118,15 +1113,6 @@ def stadium_entry(feature: dict, lat: float, lng: float) -> dict:
     }
 
 
-def recreational_entry(props: dict) -> dict:
-    return {
-        "name": props.get("SITE_NAME"),
-        "ceiling_ft": props.get("CEILING"),
-        "city": props.get("CITY"),
-        "state": props.get("STATE"),
-    }
-
-
 def airport_entry(feature: dict, lat: float, lng: float) -> dict:
     props = feature["properties"]
     plng, plat = feature["geometry"]["coordinates"][:2]
@@ -1173,7 +1159,7 @@ def authorization_note(laanc: Optional[dict]) -> str:
 
 
 def assess(controlled: list, laanc: Optional[dict], restrictions: list,
-           stadiums: list, recreational: list) -> tuple[str, list]:
+           stadiums: list) -> tuple[str, list]:
     """Boil a point's airspace down to a verdict and the notes behind it."""
     notes = []
     if any(r["severity"] == "no-fly" for r in restrictions):
@@ -1202,8 +1188,6 @@ def assess(controlled: list, laanc: Optional[dict], restrictions: list,
     if stadiums:
         notes.append("Within 3 NM of a stadium: flight is prohibited below 3,000 ft AGL "
                      "from 1 hour before to 1 hour after major sporting events.")
-    if recreational:
-        notes.append("Inside an FAA-recognized recreational flyer fixed site.")
 
     return verdict, notes
 
@@ -1217,7 +1201,6 @@ def check_point(faa: FAAClient, lat: float, lng: float, when: Optional[datetime]
         "prohibited": {},
         "defense": {},
         "nsufr": {},
-        "recreational": {},
         "stadiums": {"radius_nm": STADIUM_TFR_NM, "geometry": True},
         "tfrs": None,
     })
@@ -1237,9 +1220,8 @@ def check_point(faa: FAAClient, lat: float, lng: float, when: Optional[datetime]
     )
     stadiums = sorted((stadium_entry(f, lat, lng) for f in data["stadiums"]),
                       key=lambda s: s["distance_nm"])
-    recreational = [recreational_entry(f["properties"]) for f in data["recreational"]]
 
-    verdict, notes = assess(controlled, laanc, restrictions, stadiums, recreational)
+    verdict, notes = assess(controlled, laanc, restrictions, stadiums)
     return {
         "verdict": verdict,
         "notes": notes,
@@ -1247,7 +1229,6 @@ def check_point(faa: FAAClient, lat: float, lng: float, when: Optional[datetime]
         "laanc": laanc,
         "restrictions": restrictions,
         "stadiums": stadiums,
-        "recreational_sites": recreational,
         "tfrs_checked": len(data["tfrs"]),
         "advisory": ADVISORY,
     }
@@ -1309,8 +1290,6 @@ def summarize_survey(data: dict, lat: float, lng: float) -> dict:
             + [with_distance(tfr_entry(f["properties"]), f) for f in by_distance(data["tfrs"])],
             ("kind", "name")),
         "stadiums": [stadium_entry(f, lat, lng) for f in by_distance(data["stadiums"])],
-        "recreational_sites": [with_distance(recreational_entry(f["properties"]), f)
-                               for f in by_distance(data["recreational"])],
     }
 
 
@@ -2006,15 +1985,6 @@ def map_features(location: dict, data: dict, radius_nm: float) -> list:
              "stroke": "#8c510a", "stroke-width": 1.5, "stroke-dasharray": "4 4",
              "fill-opacity": 0.08}))
 
-    for f in data["recreational"]:
-        entry = recreational_entry(f["properties"])
-        features.append(_feature(f["geometry"], {
-            "_layer": "recreational",
-            "title": f"Recreational flyer site - {entry['name']}",
-            "Ceiling": f"{entry['ceiling_ft']} ft AGL" if entry["ceiling_ft"] is not None else None,
-            "stroke": "#1a9850", "stroke-width": 2, "fill-opacity": 0.2,
-        }))
-
     for f in data["airports"]:
         entry = airport_entry(f, lat, lng)
         features.append(_feature(f["geometry"], {
@@ -2320,10 +2290,6 @@ def print_check(location: dict, report: dict) -> None:
         for s in report["stadiums"]:
             print(f"    {s['name']} ({s['city']}, {s['state']})  {s['distance_nm']} NM {s['direction']}")
 
-    if report["recreational_sites"]:
-        print("\n  Recreational flyer fixed sites")
-        for site in report["recreational_sites"]:
-            print(f"    {site['name']}  ceiling {site['ceiling_ft']} ft AGL")
 
     print(f"\n  Map:  {_maps_url(location['latitude'], location['longitude'])}")
     print(_wrap(ADVISORY, "  "))
@@ -2366,11 +2332,6 @@ def print_nearby(location: dict, summary: dict, radius_nm: float) -> None:
         print("\n  Stadiums (3 NM event TFRs)")
         for s in summary["stadiums"]:
             print(f"    {s['name']} ({s['city']}, {s['state']})  {s['distance_nm']} NM {s['direction']}")
-
-    if summary["recreational_sites"]:
-        print("\n  Recreational flyer fixed sites")
-        for site in summary["recreational_sites"]:
-            print(f"    {site['name']}  ceiling {site['ceiling_ft']} ft AGL  {site['distance_nm']} NM")
 
     print()
     print(_wrap(ADVISORY, "  "))

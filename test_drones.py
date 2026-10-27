@@ -127,17 +127,17 @@ class InterpretationTests(OfflineCase):
     def test_verdicts(self):
         controlled = [drones.class_entry(class_c())]
         laanc = drones.laanc_entry(grid_cell(ceiling=200))
-        verdict, notes = drones.assess(controlled, laanc, [], [], [])
+        verdict, notes = drones.assess(controlled, laanc, [], [])
         self.assertEqual(verdict, "AUTHORIZATION REQUIRED")
         self.assertIn("200 ft AGL", notes[0])
 
-        verdict, _ = drones.assess([], None, [], [], [])
+        verdict, _ = drones.assess([], None, [], [])
         self.assertEqual(verdict, "CLEAR")
 
         overhead = [{"severity": "overhead"}]
-        self.assertEqual(drones.assess([], None, overhead, [], [])[0], "CLEAR")
-        self.assertEqual(drones.assess([], None, [{"severity": "caution"}], [], [])[0], "CAUTION")
-        self.assertEqual(drones.assess(controlled, laanc, [{"severity": "no-fly"}], [], [])[0],
+        self.assertEqual(drones.assess([], None, overhead, [])[0], "CLEAR")
+        self.assertEqual(drones.assess([], None, [{"severity": "caution"}], [])[0], "CAUTION")
+        self.assertEqual(drones.assess(controlled, laanc, [{"severity": "no-fly"}], [])[0],
                          "DO NOT FLY")
 
     def test_zero_ceiling_and_non_laanc_airports(self):
@@ -696,7 +696,7 @@ class TFRTimeTests(OfflineCase):
         entry = drones.tfr_entry(kept[0]["properties"])
         self.assertEqual((entry["status"], entry["severity"]), ("scheduled", "caution"))
         self.assertTrue(entry["hours"].startswith("scheduled "))
-        verdict, notes = drones.assess([], None, [entry], [], [])
+        verdict, notes = drones.assess([], None, [entry], [])
         self.assertEqual(verdict, "CAUTION")
         self.assertIn("scheduled but not active", " ".join(notes))
 

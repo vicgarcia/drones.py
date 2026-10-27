@@ -39,7 +39,6 @@ The feature services behind the FAA UAS Facility Map and the
 | `defense` | `National_Defense_Airspace_TFR_Areas` | Polygon | `NAME`, `WKHR_CODE`, `WKHR_RMK` | National defense airspace, mostly "BY NOTAM" |
 | `nsufr` | `Part_Time_National_Security_UAS_Flight_Restrictions` | Polygon | `Facility`, `Base`, `Floor`, `Ceiling`, `ALERTYPE` | Part-time national security UAS restrictions |
 | `stadiums` | `Stadiums` | Point | `NAME`, `CITY`, `STATE` | 3 NM / 3,000 ft event TFRs |
-| `recreational` | `Recreational_Flyer_Fixed_Sites` | Polygon | `SITE_NAME`, `CEILING` | FAA-recognized model aircraft fields |
 | `airports` | `US_Airport` | Point | `IDENT`, `ICAO_ID`, `NAME`, `TYPE_CODE`, `PRIVATEUSE`, `ELEVATION` | Nearby airports and heliports |
 
 ### Query pattern

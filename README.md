@@ -164,7 +164,7 @@ Serves on `127.0.0.1`, falls back to a free port if 8765 is taken, and runs unti
 
 | Data | Source |
 |------|--------|
-| LAANC grid, class airspace, special use, prohibited and defense airspace, national security UAS restrictions, stadiums, recreational sites, airports | FAA UAS Data Delivery System - the public ArcGIS layers behind the FAA UAS Facility Map |
+| LAANC grid, class airspace, special use, prohibited and defense airspace, national security UAS restrictions, stadiums, airports | FAA UAS Data Delivery System - the public ArcGIS layers behind the FAA UAS Facility Map |
 | TFR shapes, NOTAM text (effective times, altitudes) and links | tfr.faa.gov |
 | METAR, TAF and the station index | NOAA Aviation Weather Center (aviationweather.gov) |
 | Geocoding | OpenStreetMap Nominatim |
