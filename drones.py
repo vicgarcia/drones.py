@@ -100,6 +100,8 @@ MAX_PARALLEL_QUERIES = 4
 DEFAULT_RADIUS_NM = 5.0
 STADIUM_TFR_NM = 3.0
 MAX_RADIUS_NM = 30.0
+# A point check also names TFRs this close that miss the point itself
+NEARBY_TFR_NM = 10.0
 # TFRs are listed this far out whatever the search radius: there are few of
 # them and they decide whether you can fly at all
 TFR_REACH_NM = 30.0
@@ -1306,6 +1308,23 @@ def tfr_entry(props: dict) -> dict:
     }
 
 
+def nearby_tfr_entry(feature: dict, lat: float, lng: float) -> dict:
+    """A TFR that misses the point, with how far its edge is and which way it lies."""
+    vertices = _vertices(feature["geometry"])
+    bearing = calculate_bearing(lat, lng, sum(v[1] for v in vertices) / len(vertices),
+                                sum(v[0] for v in vertices) / len(vertices))
+    return {**tfr_entry(feature["properties"]),
+            "distance_nm": round(feature["properties"]["_distance_nm"], 1),
+            "direction": bearing_to_cardinal(bearing)}
+
+
+def _vertices(geometry: dict) -> list:
+    """Every [lng, lat] pair in a Polygon or MultiPolygon's outer rings."""
+    polygons = (geometry["coordinates"] if geometry["type"] == "MultiPolygon"
+                else [geometry["coordinates"]])
+    return [v for polygon in polygons for v in polygon[0]]
+
+
 def stadium_entry(feature: dict, lat: float, lng: float) -> dict:
     props = feature["properties"]
     plng, plat = feature["geometry"]["coordinates"][:2]
@@ -1417,12 +1436,21 @@ def check_point(faa: FAAClient, lat: float, lng: float, when: Optional[datetime]
     controlled = [a for a in airspace if a["surface"]]
     laanc = laanc_entry(data["laanc"][0]["properties"]) if data["laanc"] else None
 
+    # TFRs over the point restrict it; the ones close by are worth knowing about
+    for f in data["tfrs"]:
+        f["properties"]["_distance_nm"] = distance_nm(f["geometry"], lat, lng)
+    tfrs = annotate_tfrs(faa, [f for f in data["tfrs"]
+                               if f["properties"]["_distance_nm"] is not None
+                               and f["properties"]["_distance_nm"] <= NEARBY_TFR_NM], when)
+    nearby_tfrs = sorted(_dedupe(
+        [nearby_tfr_entry(f, lat, lng) for f in tfrs if not contains(f["geometry"], lat, lng)],
+        ("kind", "name")), key=lambda t: t["distance_nm"])
+
     restrictions = _dedupe(
         [sua_entry(f["properties"]) for f in data["prohibited"] + data["sua"]]
         + [defense_entry(f["properties"]) for f in data["defense"]]
         + [nsufr_entry(f["properties"]) for f in data["nsufr"]]
-        + [tfr_entry(f["properties"]) for f in annotate_tfrs(
-            faa, [f for f in data["tfrs"] if contains(f["geometry"], lat, lng)], when)],
+        + [tfr_entry(f["properties"]) for f in tfrs if contains(f["geometry"], lat, lng)],
         ("kind", "name"),
     )
     stadiums = sorted((stadium_entry(f, lat, lng) for f in data["stadiums"]),
@@ -1436,6 +1464,7 @@ def check_point(faa: FAAClient, lat: float, lng: float, when: Optional[datetime]
         "laanc": laanc,
         "restrictions": restrictions,
         "stadiums": stadiums,
+        "nearby_tfrs": nearby_tfrs,
         "tfrs_checked": len(data["tfrs"]),
         "advisory": ADVISORY,
     }
@@ -2690,6 +2719,12 @@ def print_check(location: dict, report: dict) -> None:
         for s in report["stadiums"]:
             print(f"    {s['name']} ({s['city']}, {s['state']})  {s['distance_nm']} NM {s['direction']}")
 
+    if report["nearby_tfrs"]:
+        print(f"\n  TFRs within {NEARBY_TFR_NM:g} NM (not over this point)")
+        for t in report["nearby_tfrs"]:
+            print(f"    {t['distance_nm']:g} NM {t['direction']}  {t['kind']}: {t['name']}")
+            details = [x for x in (t["status"], _altitudes(t), t.get("hours")) if x]
+            print("              " + " | ".join(details))
 
     print(f"\n  Map:  {_maps_url(location['latitude'], location['longitude'])}")
     print(_wrap(ADVISORY, "  "))

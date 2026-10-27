@@ -310,6 +310,23 @@ class CommandTests(OfflineCase):
         self.assertEqual(report["laanc"]["ceiling_ft"], 100)
         self.assertEqual(report["restrictions"][0]["kind"], "TFR (security)")
 
+    def test_airspace_names_tfrs_nearby_without_restricting(self):
+        results = {"tfrs": [feature({"notam": "6/2", "type": "SECURITY", "title": "NEAR TFR",
+                                     "url": "u"}, SQUARE)]}
+        # About 7 NM east of the square, then about 20 NM
+        for lng, expected in ((-86.85, 1), (-86.55, 0)):
+            with patch.object(drones, "gather", fake_gather(results)):
+                code, out = self.run_cli("airspace", f"41.5,{lng}", "--no-address", "--json")
+            self.assertEqual(code, 0)
+            report = json.loads(out)
+            self.assertEqual(report["restrictions"], [])
+            self.assertEqual(report["verdict"], "CLEAR")
+            self.assertEqual(len(report["nearby_tfrs"]), expected, lng)
+        with patch.object(drones, "gather", fake_gather(results)):
+            _, out = self.run_cli("airspace", "41.5,-86.85", "--no-address")
+        self.assertIn("TFRs within 10 NM", out)
+        self.assertIn("NM W  TFR (security): NEAR TFR", out)
+
     def test_airspace_text_class_g(self):
         with patch.object(drones, "gather", fake_gather({})):
             code, out = self.run_cli("airspace", "40.5,-89.9", "--no-address")
