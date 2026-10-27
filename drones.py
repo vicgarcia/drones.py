@@ -291,14 +291,6 @@ MAP_PAGE = """\
   .leaflet-popup-content { font: 13px/1.45 system-ui, sans-serif; }
   .leaflet-popup-content dt { font-weight: 600; margin-top: 4px; }
   .leaflet-popup-content dd { margin: 0; }
-  .legend {
-    background: #fff; color: #222; padding: 6px 8px; border-radius: 4px;
-    font: 12px/1.6 system-ui, sans-serif; box-shadow: 0 1px 4px rgba(0,0,0,.3);
-  }
-  .legend i {
-    display: inline-block; width: 12px; height: 12px; margin-right: 6px;
-    vertical-align: -2px; opacity: .8;
-  }
   .ceiling {
     display: none; background: none; border: none; box-shadow: none; padding: 0;
     font: 600 11px system-ui, sans-serif; color: #222;
@@ -315,7 +307,6 @@ const CENTER = __CENTER__;
 const OVERLAYS = __OVERLAYS__;
 const BASEMAPS = __BASEMAPS__;
 const DEFAULT_BASEMAP = __DEFAULT_BASEMAP__;
-const CEILING_COLORS = __CEILING_COLORS__;
 const PASSIVE = __PASSIVE__;
 // LAANC ceiling labels only once the grid cells are big enough to read
 const LABEL_ZOOM = 14;
@@ -396,15 +387,6 @@ function toggleCeilings() {
   map.getContainer().classList.toggle('show-ceilings', map.getZoom() >= LABEL_ZOOM);
 }
 map.on('zoomend', toggleCeilings);
-
-const legend = L.control({ position: 'bottomright' });
-legend.onAdd = () => {
-  const div = L.DomUtil.create('div', 'legend');
-  div.innerHTML = '<strong>LAANC ceiling (ft AGL)</strong><br>' + CEILING_COLORS
-    .map(([ft, color]) => '<i style="background:' + color + '"></i>' + ft).join('<br>');
-  return div;
-};
-legend.addTo(map);
 
 fetch('data.json')
   .then(r => r.json())
@@ -2081,7 +2063,6 @@ def map_page(location: dict, tiles: str, size: Optional[tuple[int, int]] = None)
             .replace("__OVERLAYS__", json.dumps(MAP_OVERLAYS))
             .replace("__BASEMAPS__", json.dumps(TILE_LAYERS))
             .replace("__DEFAULT_BASEMAP__", json.dumps(tiles))
-            .replace("__CEILING_COLORS__", json.dumps(CEILING_COLORS))
             .replace("__PASSIVE__", json.dumps(PASSIVE_OVERLAYS)))
 
 
