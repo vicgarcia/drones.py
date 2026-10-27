@@ -6,7 +6,10 @@ them, and what they do not cover. The README covers usage; this covers the detai
 - [FAA airspace (UAS Data Delivery System)](#faa-airspace-uas-data-delivery-system)
 - [TFRs (tfr.faa.gov)](#tfrs-tfrfaagov)
 - [Aviation weather (NOAA Aviation Weather Center)](#aviation-weather-noaa-aviation-weather-center)
+- [Live traffic and radar (adsb.fi, NOAA MRMS)](#live-traffic-and-radar-adsbfi-noaa-mrms)
 - [Drone preflight reference](#drone-preflight-reference)
+- [Drone rules (FAA regulatory sources)](#drone-rules-faa-regulatory-sources)
+- [Skill and map design](#skill-and-map-design)
 - [Gaps and caveats](#gaps-and-caveats)
 - [Sources](#sources)
 
@@ -301,6 +304,42 @@ hours, G-AIRMETs on a 3-hour cycle.
 
 ---
 
+## Live traffic and radar (adsb.fi, NOAA MRMS)
+
+Map-only layers, off unless `map --adsb` or `--radar` is passed. Neither feeds a verdict, and
+neither is in `--geojson`. The local map server proxies both (`traffic.json`, `radar.json`) so
+the page never needs keys or CORS.
+
+### Air traffic (adsb.fi)
+
+- Endpoint: `https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{dist}` (`dist` in NM, capped
+  at 250). Free open data, about 1 request a second, attribution requested.
+- drones.py sends one request at a time across all open tabs (`TRAFFIC_MIN_INTERVAL` 1.1 s), and the
+  page polls every 3 s for a circle covering its current view, pausing when the tab is hidden.
+- Fields used from each record (`ac[]`): `hex` (ICAO address, the marker id between polls), `flight`
+  then `r` (registration) for the label, `lat`/`lon`, `alt_baro`, `track` (falling back to
+  `true_heading`, `nav_heading`), `category` (`A7` is rotorcraft), `squawk` and `emergency`.
+- `alt_baro` is feet MSL barometric, or the string `"ground"`. Ground aircraft are dropped. Positions
+  older than 60 s (`seen_pos`) are dropped rather than drawn where the aircraft was.
+- Known gap: a taxiing aircraft that does not set the ground flag reports a numeric altitude, even a
+  negative one (seen at DCA: `-275 ft`), so it still draws. Filtering on low altitude plus low
+  ground speed would hide it, but also a helicopter hovering low nearby.
+- Emergency squawks 7500/7600/7700, or a non-`none` `emergency` field, get a highlight.
+- Coverage comes from volunteer receivers: low traffic far from a feeder and aircraft without ADS-B
+  are missing. Situational awareness only, never see-and-avoid.
+
+### Weather radar (NOAA MRMS)
+
+- WMS: `https://opengeo.ncep.noaa.gov/geoserver/conus/conus_bref_qcd/ows`, layer `conus_bref_qcd`
+  (quality-controlled base reflectivity mosaic, lower 48, updated every 2 minutes).
+- The browser loads tiles straight from NOAA. drones.py only reads `GetCapabilities` for the `time`
+  dimension and pins the newest frame, so a long-open map moves forward instead of showing whatever
+  frame the browser cached first. The page re-checks every 2 minutes.
+- Drawn at 60% opacity with `zIndex` 10, between the basemap (1) and the airspace overlays; without
+  it, switching basemap covers the radar.
+
+---
+
 ## Drone preflight reference
 
 ### Part 107 weather rules
@@ -334,6 +373,135 @@ compares the higher of wind and gust to one `--max-wind` and warns within 85% of
 
 ---
 
+## Drone rules (FAA regulatory sources)
+
+The skill answers rules questions from an "at a glance" summary plus an FAA rules reference of
+links (both in SKILL.md). This section records how that material was put together, so it can be
+checked and refreshed.
+
+### What is in effect (checked 2026-10-26)
+
+The skill covers rules in effect only. Proposed rules stay out until they are final and effective.
+
+| Item | Status | In the skill |
+|---|---|---|
+| 14 CFR Part 107 (with the 2021 over-people, night and recurrent-training changes) | in effect | yes |
+| 49 USC 44809, the recreational exception; TRUST | in effect | yes |
+| 14 CFR Part 89 Remote ID (compliance required since 2023-09-16) | in effect | yes |
+| 14 CFR Part 48 registration ($5, 3 years) | in effect | yes |
+| AC 107-2A (issued 2021-02-01) | active guidance | yes |
+| Section 927 waivers (2024 Reauthorization Act; FAA notice 2026-04-01) | in effect | yes, under waivers |
+| Part 107 knowledge test: image-based chart questions from 2026-10-26 | testing change only, rules unchanged | no |
+| Part 108 BVLOS rule (RIN 2120-AL82) | final rule at OIRA review since 2026-07-10, not published | no |
+| Section 2209 critical infrastructure restrictions (proposed 14 CFR Part 74, NPRM 2026-05-06) | proposed; final expected around late 2027 | no |
+
+When Part 108 or the 2209 rule is published, check its effective date before adding it. Each would
+change the skill: Part 108 as proposed adds a BVLOS path and would end most BVLOS waivers under
+Part 107; 2209 as proposed adds UAS flight restrictions over critical infrastructure, which the
+airspace check would then need to read.
+
+### Rule facts the summary relies on
+
+Verified against the eCFR text and the FAA pages on 2026-10-26.
+
+| Fact | Source |
+|---|---|
+| 400 ft AGL, or within 400 ft of a structure and no higher than 400 ft above its top | 14 CFR 107.51(b) |
+| 87 kt (100 mph) groundspeed | 107.51(a) |
+| 3 SM flight visibility from the control station | 107.51(c) |
+| 500 ft below, 2,000 ft horizontally from clouds | 107.51(d) |
+| Night and civil twilight: anti-collision lighting visible 3 SM, may be dimmed but not off | 107.29 |
+| VLOS by the pilot and the person on the controls, or by a visual observer | 107.31 |
+| Over people only if participating, under cover or in a stationary vehicle, or under Subpart D | 107.39 |
+| Moving vehicle only over sparsely populated areas, never carrying others' property for hire | 107.25 |
+| Class B, C, D and surface Class E need prior ATC authorization | 107.41 |
+| Report serious injury or loss of consciousness, or damage over $500, within 10 calendar days | 107.9 |
+| Recurrent knowledge within the previous 24 calendar months | 107.65 |
+| Certificate: 16 or older, English proficiency, the UAG knowledge test | FAA "Become a drone pilot" page |
+| Registration $5 for 3 years: per drone under Part 107, one for all drones when recreational; a recreational registration can't be used for Part 107 | FAA registration page |
+| Recreational registration needed at 250 g (0.55 lb) or more | FAA registration page |
+| Remote ID: standard Remote ID, a broadcast module, or fly inside a FRIA | FAA Remote ID page |
+| Recreational conditions: fun only, TRUST, CBO guidelines, VLOS, give way, 400 ft in Class G, authorization in controlled airspace | 44809; FAA recreational flyers page |
+| "Compensation is not the deciding factor; when in doubt assume Part 107" | FAA recreational flyers page |
+
+### Fetching the sources
+
+- **faa.gov** answers 403 to the fetch tools agents use and to plain `curl`. A browser user agent
+  works: `curl -sL -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36" URL`.
+  Strip the HTML down to `<main>` to read a page.
+- **eCFR** section URLs (`https://www.ecfr.gov/current/title-14/section-107.51`) redirect to the
+  full path and are the stable form to link. The versioner API returns a section's text as XML:
+  `https://www.ecfr.gov/api/versioner/v1/full/{YYYY-MM-DD}/title-14.xml?section=107.51`. It refuses
+  requests without compression, so pass `curl --compressed`.
+- **notams.aim.faa.gov** returns 403 to scripts; the NOTAM search link works in a browser.
+- **Moved FAA URLs** found while building the reference: the Remote Pilot Study Guide now lives under
+  `/sites/faa.gov/files/regulations_policies/handbooks_manuals/aviation/remote_pilot_study_guide.pdf`,
+  and the Aviation Weather Handbook under `/regulationspolicies/handbooksmanuals/aviation/faa-h-8083-28-aviation-weather-handbook`
+  (no underscores). The National Park Service has no stable drone page, so the reference cites
+  36 CFR 1.5, the closure authority behind each park's drone rule.
+- To find current FAA links, harvest the `href`s from `https://www.faa.gov/uas` and its section
+  pages rather than guessing paths.
+
+### Refreshing the reference
+
+1. Re-check every link in SKILL.md's FAA rules reference returns 200 with a browser user agent.
+2. Check the Federal Register and the FAA UAS pages for final rules (Part 108, Section 2209) and
+   new advisory circulars (AC 107-2A's successor).
+3. Re-read the eCFR text of the sections in the facts table above, through the versioner API with a
+   current date, and update the summary if a number changed.
+4. Update the "checked" date in SKILL.md and here.
+
+---
+
+## Skill and map design
+
+Decisions made while shaping how agents use drones.py, and why.
+
+### Skill defaults
+
+- **Airspace first.** Most questions are "can I fly here", so `airspace` is the default answer.
+  Weather (`metar`, `taf`, `preflight`) runs only when the user asks about weather, wind or a time;
+  in practice station weather rarely changes the answer while exploring.
+- **Verdict card.** Answers are a few lines: verdict and resolved address, surface class and LAANC
+  ceiling with how to get approval, TFRs (here and within 10 NM), only the extra lines that apply,
+  and the Google Maps link. Full output only on request.
+- **Map on request only**, interactive, run in the background with its URL handed over; one map at
+  a time, stopped when the user is done. PNG only when an image is asked for.
+- **Live view is opt-in**: `--adsb --radar` only for "live", "traffic" or "radar" requests.
+- **Mission areas**: `airspace` checks one point, so a site that straddles a LAANC grid or class
+  boundary needs `nearby` with a radius about the site's size, planning to the lowest ceiling.
+- **One file.** The skill is a single SKILL.md, including the FAA rules reference, so installing it
+  is one copy.
+
+### Distances
+
+| Setting | Value | Why |
+|---|---|---|
+| Default search radius (`map`, `nearby`) | 5 NM | the neighborhood; at 10 NM the map around an airport carried 900+ LAANC cells |
+| Maximum radius | 30 NM | wider is regional planning, not a drone question |
+| TFR reach | 30 NM, whatever the radius | few TFRs, and they decide whether you can fly at all; a TFR 6.4 NM out fell outside a 5 NM radius |
+| Nearby TFRs in `airspace` | 10 NM | close enough that a change of plan or spot could put the flight inside |
+
+### Map page
+
+- Airspace only by default. No legends; layers are toggled in a lowercase panel without counts.
+- Panel order is draw order with moves (`PANEL_MOVES`): TFRs above class airspace, LAANC right after
+  it. Draw order itself keeps TFRs on top so they stay clickable.
+- LAANC grid and TFR toggles are always listed (`ALWAYS_LISTED`), even when empty, so "none here"
+  is visible. The search center and radius ring are always drawn and not listed (`FIXED_OVERLAYS`).
+- Styling: radius ring and a tiny center dot in `#737373`; airports as blue dots without a ring
+  (public `#2166ac` 8.5 px, private `#6baed6` 6 px). `marker-size` takes a number for sizes between
+  simplestyle's names.
+- Performance: Leaflet repositions every bound tooltip on each zoom step, and binding a permanent
+  label to all 924 LAANC cells made zooming lag. Labels are bound only to cells in view at zoom
+  14 and above. Tiles skip loading mid-zoom (`updateWhenZooming: false`).
+- Wheel zoom uses `@luomus/leaflet-smooth-wheel-zoom@1.0.0` (MIT, read before adopting) for
+  continuous zoom rather than Leaflet's stepped wheel zoom.
+- The page title is just the place; the attribution line credits the tile, traffic and radar
+  providers without Leaflet's prefix.
+
+---
+
 ## Gaps and caveats
 
 **Not covered by drones.py:**
@@ -352,7 +520,7 @@ compares the higher of wind and gust to one `--max-wind` and warns within 85% of
 | Gap | Note |
 |---|---|
 | Wind at flight altitude | METARs measure about 10 m above the airport; wind at 400 ft AGL is often quite different. NOAA HRRR model data or a micro-forecast service would be needed. |
-| Precipitation radar | Not exposed; `api.weather.gov/radar` has tile overlays. |
+| Precipitation radar | Not in AWC's API; the map takes radar from NOAA MRMS instead (see above). |
 | Lightning detection | Commercial only (Vaisala, Earth Networks). |
 | Sub-hourly updates | Standard METARs are hourly and SPECIs fire only on threshold changes. |
 
@@ -376,3 +544,11 @@ compares the higher of wind and gust to one `--max-wind` and warns within 85% of
   parameter reference
 - [Bulk station file](https://aviationweather.gov/data/cache/stations.cache.xml.gz)
 - [14 CFR Part 107, small UAS operating rules](https://www.ecfr.gov/current/title-14/chapter-I/subchapter-F/part-107)
+  and the [eCFR versioner API](https://www.ecfr.gov/developers/documentation/api/v1)
+- [FAA UAS pages](https://www.faa.gov/uas) and [AC 107-2A](https://www.faa.gov/documentLibrary/media/Advisory_Circular/AC_107-2A.pdf)
+- [adsb.fi open data API](https://github.com/adsbfi/opendata)
+- [NOAA MRMS](https://www.nssl.noaa.gov/projects/mrms/) and the
+  [MRMS base reflectivity WMS](https://opengeo.ncep.noaa.gov/geoserver/conus/conus_bref_qcd/ows?service=WMS&request=GetCapabilities)
+- Rule status: [UAS Dashboard on Part 108](https://uasdashboard.com/guides/part-108-guide),
+  [Venable on the Section 2209 NPRM](https://www.venable.com/insights/publications/2026/05/faa-releases-section-2209-proposed-rule-on-drone),
+  [DroneLife on the 2026 knowledge test change](https://dronelife.com/2026/10/09/faa-part-107-test-changes-october-2026/)
