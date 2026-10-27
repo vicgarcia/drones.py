@@ -286,6 +286,7 @@ MAP_PAGE = """\
 <title>__TITLE__</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@luomus/leaflet-smooth-wheel-zoom@1.0.0/SmoothWheelZoom.js"></script>
 <style>
   html, body, #map { height: 100%; margin: 0; }
   .leaflet-popup-content { font: 13px/1.45 system-ui, sans-serif; }
@@ -312,14 +313,19 @@ const LABEL_ZOOM = 14;
 
 // Fractional zoom lets fitBounds fill the view with the radius ring instead
 // of snapping out to the next whole level, which can leave half the frame empty
-const map = L.map('map', { preferCanvas: true, zoomSnap: 0.1 });
+// The wheel eases toward its target zoom every frame rather than in steps
+const map = L.map('map', {
+  preferCanvas: true, zoomSnap: 0.1,
+  scrollWheelZoom: false, smoothWheelZoom: true, smoothSensitivity: 1
+});
 // Credit the tile providers only, without Leaflet's own link and flag
 map.attributionControl.setPrefix(false);
 const bases = {};
 for (const [name, tiles] of Object.entries(BASEMAPS)) {
   // Upscale past a provider's last zoom level rather than going blank
   bases[name] = L.tileLayer(tiles.url, {
-    maxNativeZoom: tiles.max_zoom, maxZoom: 19, attribution: tiles.attribution
+    maxNativeZoom: tiles.max_zoom, maxZoom: 19, attribution: tiles.attribution,
+    updateWhenZooming: false
   });
 }
 bases[DEFAULT_BASEMAP].addTo(map);
