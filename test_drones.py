@@ -332,6 +332,20 @@ class CommandTests(OfflineCase):
         known = {key for key, _ in drones.MAP_OVERLAYS}
         self.assertTrue(set(layers) <= known)
 
+    def test_tfrs_reach_30_nm_past_a_small_radius(self):
+        def tfr(notam):
+            return feature({"notam": notam, "type": "SECURITY", "title": notam,
+                            "url": f"https://tfr.faa.gov/tfr3/?page=detail_{notam.replace('/', '_')}"},
+                           SQUARE)
+        results = {"tfrs": [tfr("6/0001")]}
+        # About 13 NM east of the square, then about 40 NM
+        for lng, expected in ((-86.7, 1), (-86.1, 0)):
+            with patch.object(drones, "gather", fake_gather(results)):
+                code, out = self.run_cli("map", f"41.5,{lng}", "--no-address", "--geojson")
+            self.assertEqual(code, 0)
+            tfrs = [f for f in json.loads(out)["features"] if f["properties"]["_layer"] == "tfrs"]
+            self.assertEqual(len(tfrs), expected, lng)
+
     def test_renewed_tfrs_on_one_shape_draw_once(self):
         def tfr(notam, title):
             return feature({"notam": notam, "type": "SECURITY", "title": title,

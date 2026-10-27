@@ -160,7 +160,8 @@ drones.py map "Chicago Midway Airport" --adsb --radar
 ```
 
 The map shows airspace only unless you opt in to live traffic or radar. The
-search radius is 5 NM by default (up to 30) for both `map` and `nearby`.
+search radius is 5 NM by default (up to 30) for both `map` and `nearby`. TFRs are always
+included out to 30 NM, whatever the radius.
 
 `--adsb` adds live air traffic from [adsb.fi](https://adsb.fi), polled every 3 seconds and coloured by
 altitude. Coverage comes from volunteer ground receivers, so low traffic far from a feeder and

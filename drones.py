@@ -100,6 +100,9 @@ MAX_PARALLEL_QUERIES = 4
 DEFAULT_RADIUS_NM = 5.0
 STADIUM_TFR_NM = 3.0
 MAX_RADIUS_NM = 30.0
+# TFRs are listed this far out whatever the search radius: there are few of
+# them and they decide whether you can fly at all
+TFR_REACH_NM = 30.0
 
 # Page time a headless screenshot allows for tiles and data to load
 SCREENSHOT_WAIT_MS = 20000
@@ -1443,7 +1446,8 @@ def survey(faa: FAAClient, lat: float, lng: float, radius_nm: float,
     """
     Every feature within radius_nm, with geometry, keyed by layer.
 
-    Stadiums are searched a further 3 NM out since their event TFRs reach in.
+    Stadiums are searched a further 3 NM out since their event TFRs reach in,
+    and TFRs out to TFR_REACH_NM.
     """
     wanted = {name: {"radius_nm": radius_nm, "geometry": True} for name in LAYERS}
     wanted["stadiums"]["radius_nm"] = radius_nm + STADIUM_TFR_NM
@@ -1457,7 +1461,7 @@ def survey(faa: FAAClient, lat: float, lng: float, radius_nm: float,
 
     data["tfrs"] = annotate_tfrs(faa, [f for f in data["tfrs"]
                                        if f["properties"]["_distance_nm"] is not None
-                                       and f["properties"]["_distance_nm"] <= radius_nm], when)
+                                       and f["properties"]["_distance_nm"] <= max(radius_nm, TFR_REACH_NM)], when)
     return data
 
 
