@@ -152,6 +152,11 @@ TILE_LAYERS = {
         "attribution": 'Tiles &copy; <a href="https://www.esri.com/">Esri</a>, Maxar, Earthstar Geographics',
         "max_zoom": 19,
     },
+    "light": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        "attribution": 'Tiles &copy; <a href="https://www.esri.com/">Esri</a> | &copy; OpenStreetMap contributors',
+        "max_zoom": 16,
+    },
     "dark": {
         "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
         "attribution": 'Tiles &copy; <a href="https://www.esri.com/">Esri</a> | &copy; OpenStreetMap contributors',
