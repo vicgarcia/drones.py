@@ -97,8 +97,9 @@ RETRY_DELAYS = (2, 5, 10)
 # Concurrent layer queries; ArcGIS Online throttles bigger bursts
 MAX_PARALLEL_QUERIES = 4
 
-DEFAULT_RADIUS_NM = 10.0
+DEFAULT_RADIUS_NM = 5.0
 STADIUM_TFR_NM = 3.0
+MAX_RADIUS_NM = 30.0
 
 # Page time a headless screenshot allows for tiles and data to load
 SCREENSHOT_WAIT_MS = 20000
@@ -2874,8 +2875,8 @@ def _fail(message: str) -> int:
 
 
 def _check_radius(radius_nm: float) -> None:
-    if not math.isfinite(radius_nm) or radius_nm <= 0 or radius_nm > 50:
-        raise DronesError("--radius must be between 0 and 50 NM")
+    if not math.isfinite(radius_nm) or radius_nm <= 0 or radius_nm > MAX_RADIUS_NM:
+        raise DronesError(f"--radius must be between 0 and {MAX_RADIUS_NM:g} NM")
 
 
 def _locate(args: argparse.Namespace, lookup_address: bool = True) -> dict:
@@ -3149,7 +3150,7 @@ def _add_radius_option(parser: argparse.ArgumentParser) -> None:
         "--radius", "-r",
         type=float,
         default=DEFAULT_RADIUS_NM,
-        help=f"Search radius in nautical miles, up to 50 (default: {DEFAULT_RADIUS_NM:g})"
+        help=f"Search radius in nautical miles, up to {MAX_RADIUS_NM:g} (default: {DEFAULT_RADIUS_NM:g})"
     )
 
 
@@ -3179,7 +3180,7 @@ def build_parser() -> argparse.ArgumentParser:
     nearby_parser = subparsers.add_parser(
         "nearby",
         help="Airspace, airports and restrictions within a radius",
-        description="Everything within a radius (default 10 NM) of a point."
+        description=f"Everything within a radius (default {DEFAULT_RADIUS_NM:g} NM) of a point."
     )
     _add_location_options(nearby_parser)
     _add_radius_option(nearby_parser)
@@ -3280,7 +3281,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--radius", "-r",
         type=float,
         default=DEFAULT_STATION_RADIUS_NM,
-        help=f"Search radius in nautical miles, up to 50 (default: {DEFAULT_STATION_RADIUS_NM:g})"
+        help=f"Search radius in nautical miles, up to {MAX_RADIUS_NM:g} (default: {DEFAULT_STATION_RADIUS_NM:g})"
     )
     stations_parser.add_argument("--taf-only", action="store_true",
                                  help="Only stations that issue TAFs")

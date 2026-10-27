@@ -159,6 +159,9 @@ drones.py map 41.79,-87.74 --png midway.png --tiles satellite --size 1920x1080
 drones.py map "Chicago Midway Airport" --adsb --radar
 ```
 
+The map shows airspace only unless you opt in to live traffic or radar. The
+search radius is 5 NM by default (up to 30) for both `map` and `nearby`.
+
 `--adsb` adds live air traffic from [adsb.fi](https://adsb.fi), polled every 3 seconds and coloured by
 altitude. Coverage comes from volunteer ground receivers, so low traffic far from a feeder and
 aircraft without ADS-B are missing: situational awareness, not see-and-avoid. `--radar` adds
